@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Simulador de Lutas</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #eef1f7; --panel: #ffffff; --row: #f4f6fb; --line: #d7dce8; --ink: #0e0e1d; --muted: #5d6478;
+  --a: #2f7cf6; --a-soft: #e4eeff; --b: #ef4058; --b-soft: #ffe6ea; --ok: #2fbf5b; --stroke: #0e0e1d;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.35 "Fredoka", system-ui, sans-serif; }
+header { padding: 18px 16px 6px; text-align: center; }
+h1 { margin: 0; font-size: 28px; font-weight: 700; }
+header p { margin: 4px 0 0; color: var(--muted); }
+main { max-width: 1240px; margin: 0 auto; padding: 12px 16px 40px; }
+.teams { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 900px) { .teams { grid-template-columns: 1fr; } }
+.team { background: var(--panel); border: 2px solid var(--stroke); border-radius: 14px; padding: 12px; }
+.team h2 { margin: 0 0 10px; font-size: 20px; display: flex; align-items: center; gap: 8px; }
+.team h2 .dot { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--stroke); }
+.team.A h2 .dot { background: var(--a); } .team.B h2 .dot { background: var(--b); }
+.team.A { box-shadow: 0 4px 0 var(--a); } .team.B { box-shadow: 0 4px 0 var(--b); }
+.slot { background: var(--row); border-radius: 12px; padding: 10px; margin-bottom: 10px; }
+.slot:last-child { margin-bottom: 0; }
+.slot-top { display: flex; gap: 8px; align-items: center; }
+.slot-num { font-weight: 700; color: var(--muted); width: 18px; }
+.grid { display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center; margin-top: 8px; }
+.grid label { color: var(--muted); font-size: 13px; }
+.row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.passive { font-size: 12.5px; color: var(--muted); margin: 6px 0 0 26px; }
+.stats { font-size: 12.5px; margin: 4px 0 0 26px; color: var(--ink); }
+
+/* botões quadrados com faixa escura embaixo */
+button { font: inherit; cursor: pointer; }
+.btn { border: 2px solid var(--stroke); border-radius: 8px; background: linear-gradient(#fff, #e6e9f1);
+  box-shadow: 0 3px 0 var(--stroke); padding: 3px 10px; font-weight: 600; min-width: 34px; }
+.btn:active { transform: translateY(2px); box-shadow: 0 1px 0 var(--stroke); }
+.btn.go { background: linear-gradient(#55e07c, var(--ok)); color: #fff; font-size: 20px; padding: 8px 28px;
+  text-shadow: 0 2px 0 rgba(0,0,0,.35); }
+.btn.small { padding: 1px 8px; font-size: 13px; }
+.level { min-width: 52px; text-align: center; font-weight: 700; }
+input[type=number] { font: inherit; width: 70px; padding: 3px 6px; border: 2px solid var(--line); border-radius: 8px; background: #fff; }
+select { font: inherit; padding: 3px 6px; border: 2px solid var(--line); border-radius: 8px; background: #fff; }
+
+.stars { display: flex; gap: 2px; }
+.star { font-size: 22px; line-height: 1; cursor: pointer; color: #c9cede; -webkit-text-stroke: 1px var(--stroke); user-select: none; }
+.star.on { color: #ffcd32; }
+
+/* lista suspensa com o nome na cor da raridade */
+.pick { position: relative; flex: 1; min-width: 0; }
+.pick-btn { width: 100%; text-align: left; border: 2px solid var(--stroke); border-radius: 8px; background: #fff;
+  padding: 5px 30px 5px 10px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; position: relative; }
+.pick-btn::after { content: "▾"; position: absolute; right: 10px; top: 50%; transform: translateY(-50%); color: var(--muted); }
+.pick-list { position: absolute; z-index: 20; left: 0; right: 0; top: calc(100% + 4px); background: #fff;
+  border: 2px solid var(--stroke); border-radius: 10px; box-shadow: 0 8px 24px rgba(14,14,29,.18); max-height: 340px;
+  overflow-y: auto; display: none; }
+.pick.open .pick-list { display: block; }
+.pick-search { position: sticky; top: 0; background: #fff; padding: 6px; border-bottom: 1px solid var(--line); }
+.pick-search input { width: 100%; font: inherit; padding: 4px 8px; border: 2px solid var(--line); border-radius: 8px; }
+.pick-group { font-size: 12px; font-weight: 700; padding: 6px 10px 2px; text-transform: uppercase; letter-spacing: .04em; }
+.pick-item { padding: 5px 10px; cursor: pointer; font-weight: 600; display: flex; justify-content: space-between; gap: 8px; }
+.pick-item:hover, .pick-item.sel { background: var(--row); }
+.pick-item small { color: var(--muted); font-weight: 500; }
+.name { -webkit-text-stroke: .35px rgba(14,14,29,.55); }
+.rainbow { background: linear-gradient(90deg, #ff4d4d, #ffb84d, #f3e34a, #4dd17a, #4db8ff, #9b6bff, #ff4dd8, #ff4d4d);
+  background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent;
+  animation: slide 3s linear infinite; -webkit-text-stroke: .5px rgba(14,14,29,.7); }
+@keyframes slide { to { background-position: -200% 0; } }
+
+.controls { display: flex; justify-content: center; align-items: center; gap: 14px; margin: 18px 0; flex-wrap: wrap; }
+.result { background: var(--panel); border: 2px solid var(--stroke); border-radius: 14px; padding: 14px; display: none; }
+.result.show { display: block; }
+.winbar { display: flex; height: 34px; border: 2px solid var(--stroke); border-radius: 10px; overflow: hidden; font-weight: 700; color: #fff;
+  text-shadow: 0 2px 0 rgba(0,0,0,.35); }
+.winbar div { display: flex; align-items: center; justify-content: center; min-width: 0; white-space: nowrap; overflow: hidden; }
+.winbar .wa { background: var(--a); } .winbar .wd { background: #9aa1b4; } .winbar .wb { background: var(--b); }
+.summary { display: flex; gap: 18px; flex-wrap: wrap; margin: 10px 0 14px; color: var(--muted); }
+.summary b { color: var(--ink); }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th { text-align: left; color: var(--muted); font-weight: 600; font-size: 12.5px; padding: 6px 8px; border-bottom: 2px solid var(--line); }
+td { padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td.num, th.num { text-align: right; }
+tr.sideA td:first-child { border-left: 5px solid var(--a); } tr.sideB td:first-child { border-left: 5px solid var(--b); }
+.bar { height: 8px; background: var(--row); border-radius: 4px; overflow: hidden; min-width: 70px; }
+.bar i { display: block; height: 100%; }
+.err { color: var(--b); font-weight: 600; white-space: pre-wrap; }
+.note { color: var(--muted); font-size: 12.5px; margin-top: 10px; }
+.tablewrap { overflow-x: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>⚔️ Simulador de Lutas 3x3</h1>
+  <p id="sub">Carregando o motor de luta...</p>
+</header>
+<main>
+  <div class="teams">
+    <section class="team A"><h2><span class="dot"></span>Time A</h2><div id="teamA"></div></section>
+    <section class="team B"><h2><span class="dot"></span>Time B</h2><div id="teamB"></div></section>
+  </div>
+  <div class="controls">
+    <span class="row"><label for="runs">Lutas:</label><input id="runs" type="number" min="1" max="2000" value="200"></span>
+    <button class="btn go" id="go">LUTAR!</button>
+    <button class="btn" id="swap">⇄ Trocar times</button>
+  </div>
+  <section class="result" id="result"></section>
+  <p class="note">Sem árvore de skills dos donos. Tamanho não muda a luta. Cada luta usa uma semente diferente; o sorteio não é o mesmo do Roblox, então a mesma semente não repete a luta do jogo.</p>
+</main>
+<script type="module">
+import { LuauState } from "./vendor/luau-web/index.js";
+const LEVEL_STEP = 25;
+const ROLES = { Tank: "Tanque", Fighter: "Lutador", Attacker: "Atacante", Speedy: "Veloz" };
+let DATA = null;
+const state = { A: [], B: [] };
+const rarityById = {};
+const speciesById = {};
+const artifactById = {};
+
+function blank() { return { Species: "", Level: 1, Stars: 0, Mutation: "", Artifact: "", Artifact2: "", Talent: 0 }; }
+
+function nameSpan(text, rarityId) {
+  const span = document.createElement("span");
+  span.textContent = text;
+  const rarity = rarityById[rarityId];
+  span.className = "name";
+  if (rarity && rarity.Rainbow) span.classList.add("rainbow");
+  else if (rarity) span.style.color = rarity.Color;
+  return span;
+}
+
+// Lista suspensa com busca; items = [{ id, label, rarity, hint }], grupos pela raridade
+function picker(items, value, placeholder, onPick) {
+  const root = document.createElement("div");
+  root.className = "pick";
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "pick-btn";
+  const list = document.createElement("div");
+  list.className = "pick-list";
+  const search = document.createElement("div");
+  search.className = "pick-search";
+  const input = document.createElement("input");
+  input.placeholder = "Buscar...";
+  search.appendChild(input);
+  function paintButton() {
+    btn.textContent = "";
+    const item = items.find(i => i.id === value);
+    if (item) btn.appendChild(nameSpan(item.label, item.rarity));
+    else { const s = document.createElement("span"); s.style.color = "var(--muted)"; s.textContent = placeholder; btn.appendChild(s); }
+  }
+  function render() {
+    list.textContent = "";
+    list.appendChild(search);
+    const q = input.value.trim().toLowerCase();
+    const none = document.createElement("div");
+    none.className = "pick-item";
+    none.innerHTML = `<span style="color:var(--muted)">— ${placeholder} —</span>`;
+    none.onclick = () => choose("");
+    list.appendChild(none);
+    let group = null;
+    for (const item of items) {
+      if (q && !item.label.toLowerCase().includes(q)) continue;
+      if (item.rarity !== group) {
+        group = item.rarity;
+        const g = document.createElement("div");
+        g.className = "pick-group";
+        g.appendChild(nameSpan(rarityById[group] ? rarityById[group].Name : group, group));
+        list.appendChild(g);
+      }
+      const row = document.createElement("div");
+      row.className = "pick-item" + (item.id === value ? " sel" : "");
+      row.appendChild(nameSpan(item.label, item.rarity));
+      if (item.hint) { const h = document.createElement("small"); h.textContent = item.hint; row.appendChild(h); }
+      row.title = item.title || "";
+      row.onclick = () => choose(item.id);
+      list.appendChild(row);
+    }
+  }
+  function choose(id) { value = id; root.classList.remove("open"); paintButton(); onPick(id); }
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    const open = !root.classList.contains("open");
+    document.querySelectorAll(".pick.open").forEach(p => p.classList.remove("open"));
+    if (open) { root.classList.add("open"); input.value = ""; render(); input.focus(); }
+  };
+  input.oninput = render;
+  input.onclick = (e) => e.stopPropagation();
+  list.onclick = (e) => e.stopPropagation();
+  root.append(btn, list);
+  paintButton();
+  return root;
+}
+document.addEventListener("click", () => document.querySelectorAll(".pick.open").forEach(p => p.classList.remove("open")));
+
+function speciesItems() {
+  return DATA.Species.map(s => ({ id: s.Id, label: s.Name, rarity: s.Rarity, hint: ROLES[s.Role] || s.Role, title: s.Passive || "" }));
+}
+function artifactItems() {
+  const order = DATA.Rarities.map(r => r.Id).reverse();
+  const list = DATA.Artifacts.slice().sort((a, b) => order.indexOf(a.Rarity) - order.indexOf(b.Rarity) || a.Name.localeCompare(b.Name));
+  return list.map(a => ({ id: a.Id, label: a.Name, rarity: a.Rarity, hint: a.Value || "", title: a.Description }));
+}
+
+function nextLevel(level, dir) {
+  if (dir > 0) return Math.min(DATA.MaxLevel, level < LEVEL_STEP ? LEVEL_STEP : Math.floor(level / LEVEL_STEP) * LEVEL_STEP + LEVEL_STEP);
+  if (level <= LEVEL_STEP) return 1;
+  return Math.ceil(level / LEVEL_STEP) * LEVEL_STEP - LEVEL_STEP;
+}
+
+function renderTeam(side) {
+  const host = document.getElementById("team" + side);
+  host.textContent = "";
+  state[side].forEach((unit, index) => {
+    const slot = document.createElement("div");
+    slot.className = "slot";
+    const top = document.createElement("div");
+    top.className = "slot-top";
+    const num = document.createElement("span");
+    num.className = "slot-num";
+    num.textContent = index + 1;
+    top.append(num, picker(speciesItems(), unit.Species, "Nenhum", id => { unit.Species = id; renderTeam(side); save(); }));
+    slot.appendChild(top);
+    if (unit.Species) {
+      const species = speciesById[unit.Species];
+      const grid = document.createElement("div");
+      grid.className = "grid";
+      grid.style.marginLeft = "26px";
+
+      // Nível de 25 em 25
+      const levelRow = document.createElement("div");
+      levelRow.className = "row";
+      const minus = document.createElement("button");
+      minus.className = "btn small"; minus.textContent = "−25";
+      const show = document.createElement("span");
+      show.className = "level"; show.textContent = "Nv " + unit.Level;
+      const plus = document.createElement("button");
+      plus.className = "btn small"; plus.textContent = "+25";
+      minus.onclick = () => { unit.Level = nextLevel(unit.Level, -1); show.textContent = "Nv " + unit.Level; save(); };
+      plus.onclick = () => { unit.Level = nextLevel(unit.Level, 1); show.textContent = "Nv " + unit.Level; save(); };
+      const max = document.createElement("button");
+      max.className = "btn small"; max.textContent = "Máx";
+      max.onclick = () => { unit.Level = DATA.MaxLevel; show.textContent = "Nv " + unit.Level; save(); };
+      levelRow.append(minus, show, plus, max);
+
+      // Estrelas
+      const stars = document.createElement("div");
+      stars.className = "stars";
+      for (let s = 1; s <= DATA.MaxStars; s++) {
+        const star = document.createElement("span");
+        star.className = "star" + (s <= unit.Stars ? " on" : "");
+        star.textContent = "★";
+        star.title = s + " estrela" + (s > 1 ? "s" : "");
+        star.onclick = () => { unit.Stars = unit.Stars === s ? s - 1 : s; renderTeam(side); save(); };
+        stars.appendChild(star);
+      }
+
+      const mutation = document.createElement("select");
+      mutation.innerHTML = `<option value="">Nenhuma</option>` + DATA.Mutations.map(m => `<option value="${m.Id}">${m.Name} (+${Math.round(m.Bonus * 100)}%)</option>`).join("");
+      mutation.value = unit.Mutation;
+      mutation.onchange = () => { unit.Mutation = mutation.value; save(); };
+
+      const talent = document.createElement("input");
+      talent.type = "number"; talent.min = 0; talent.max = DATA.MaxTalent; talent.value = unit.Talent;
+      talent.onchange = () => { unit.Talent = Math.max(0, Math.min(DATA.MaxTalent, Number(talent.value) || 0)); talent.value = unit.Talent; save(); };
+      const talentRow = document.createElement("div");
+      talentRow.className = "row";
+      talentRow.append(talent, Object.assign(document.createElement("span"), { textContent: "% nos 3 stats", style: "color:var(--muted);font-size:13px" }));
+
+      const art1 = picker(artifactItems(), unit.Artifact, "Sem artefato", id => { unit.Artifact = id; save(); });
+      const art2 = picker(artifactItems(), unit.Artifact2, "Sem artefato", id => { unit.Artifact2 = id; save(); });
+
+      const add = (label, el) => { const l = document.createElement("label"); l.textContent = label; grid.append(l, el); };
+      add("Nível", levelRow);
+      add("Estrelas", stars);
+      add("Mutação", mutation);
+      add("Talento", talentRow);
+      add("Artefato 1", art1);
+      add("Artefato 2", art2);
+      slot.appendChild(grid);
+      if (species && species.Passive) {
+        const p = document.createElement("div");
+        p.className = "passive";
+        p.textContent = "✨ " + species.Passive;
+        slot.appendChild(p);
+      }
+    }
+    host.appendChild(slot);
+  });
+}
+
+function save() { try { localStorage.setItem("battlesim", JSON.stringify(state)); } catch (e) {} }
+function load() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("battlesim") || "null");
+    if (saved && saved.A && saved.B) {
+      for (const side of ["A", "B"]) state[side] = [0, 1, 2].map(i => Object.assign(blank(), saved[side][i] || {}));
+      return;
+    }
+  } catch (e) {}
+  state.A = [blank(), blank(), blank()];
+  state.B = [blank(), blank(), blank()];
+}
+
+const fmt = n => Math.round(n).toLocaleString("pt-BR");
+const pct = n => (Math.round(n * 1000) / 10).toLocaleString("pt-BR") + "%";
+
+async function run() {
+  const go = document.getElementById("go");
+  const box = document.getElementById("result");
+  const teams = { A: {}, B: {} };
+  for (const side of ["A", "B"]) state[side].forEach((u, i) => { if (u.Species) teams[side][String(i + 1)] = u; });
+  go.disabled = true; go.textContent = "Lutando...";
+  try {
+    const runs = Math.max(1, Math.min(2000, Number(document.getElementById("runs").value) || 100));
+    await new Promise(r => setTimeout(r, 30)); // deixa a tela mostrar "Lutando..." antes das contas
+    const res = JSON.parse(await engine("run", JSON.stringify({ Runs: runs, Teams: teams })));
+    box.classList.add("show");
+    if (res.Error) { box.innerHTML = `<div class="err">${res.Error}</div>`; return; }
+    const wa = res.Wins.A || 0, wb = res.Wins.B || 0, wd = res.Draws || 0, total = res.Runs || 1;
+    const seg = (cls, n, label) => n > 0 ? `<div class="${cls}" style="width:${n / total * 100}%">${label} ${pct(n / total)}</div>` : "";
+    const maxDealt = Math.max(1, ...res.Units.map(u => u.Dealt));
+    let rows = "";
+    for (const u of res.Units) {
+      const s = speciesById[u.Species];
+      const color = u.Side === "A" ? "var(--a)" : "var(--b)";
+      const name = document.createElement("div");
+      name.appendChild(nameSpan(s ? s.Name : u.Species, s ? s.Rarity : ""));
+      rows += `<tr class="side${u.Side}"><td>${u.Side}${u.Slot} ${name.innerHTML}</td>
+        <td class="num">${fmt(u.MaxHp)}</td><td class="num">${fmt(u.Atk)}</td><td class="num">${fmt(u.Spd)}</td>
+        <td class="num">${fmt(u.Dealt)}</td><td><div class="bar"><i style="width:${u.Dealt / maxDealt * 100}%;background:${color}"></i></div></td>
+        <td class="num">${fmt(u.Taken)}</td><td class="num">${fmt(u.Healed)}</td><td class="num">${pct(u.Survived)}</td></tr>`;
+    }
+    box.innerHTML = `
+      <div class="winbar">${seg("wa", wa, "Time A")}${seg("wd", wd, "Empate")}${seg("wb", wb, "Time B")}</div>
+      <div class="summary">
+        <span>Lutas: <b>${fmt(total)}</b></span>
+        <span>Vitórias A: <b style="color:var(--a)">${fmt(wa)}</b></span>
+        <span>Vitórias B: <b style="color:var(--b)">${fmt(wb)}</b></span>
+        <span>Tempo médio: <b>${res.AvgSeconds.toLocaleString("pt-BR")} s</b></span>
+        ${res.Failures ? `<span class="err">Lutas com erro: ${res.Failures}</span>` : ""}
+      </div>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Brainrot</th><th class="num">Vida</th><th class="num">Ataque</th><th class="num">Velocidade</th>
+        <th class="num">Dano causado</th><th></th><th class="num">Dano recebido</th><th class="num">Curou</th><th class="num">Ficou de pé</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>
+      <p class="note">Dano, recebido e cura = média por luta. Vida já com o multiplicador de Vida da Arena.</p>
+      ${res.Sample && res.Sample.Error ? `<div class="err">${res.Sample.Error}</div>` : ""}`;
+  } catch (e) {
+    box.classList.add("show");
+    box.innerHTML = `<div class="err">Deu erro na luta:\n${e}</div>`;
+  } finally {
+    go.disabled = false; go.textContent = "LUTAR!";
+  }
+}
+
+document.getElementById("go").onclick = run;
+document.getElementById("swap").onclick = () => { const a = state.A; state.A = state.B; state.B = a; renderTeam("A"); renderTeam("B"); save(); };
+
+let engine = null;
+async function boot() {
+  let lua = null;
+  // __compile: o loadstring do luau-web (dentro do Luau ele não existe); o engine compila cada módulo por ele
+  lua = await LuauState.createAsync({ __compile: (text, name) => lua.loadstring(text, name, true) });
+  const source = await fetch("./engine.luau").then(r => r.text());
+  // O luau-web devolve uma Promise com a lista dos valores de retorno
+  const [call] = await lua.loadstring(source, "engine", true)();
+  engine = async (command, text) => (await call(command, text))[0];
+  return JSON.parse(await engine("data", ""));
+}
+boot().then(data => {
+  if (data.Error) { document.querySelector("main").innerHTML = `<div class="err">${data.Error}</div>`; return; }
+  DATA = data;
+  data.Rarities.forEach(r => rarityById[r.Id] = r);
+  data.Species.forEach(s => speciesById[s.Id] = s);
+  data.Artifacts.forEach(a => artifactById[a.Id] = a);
+  document.getElementById("sub").textContent = "Motor de verdade do PvP do jogo · brainrots Épicos para cima";
+  load();
+  renderTeam("A"); renderTeam("B");
+}).catch(e => { document.querySelector("main").innerHTML = `<div class="err">Não consegui ler os dados: ${e}</div>`; });
+</script>
+</body>
+</html>

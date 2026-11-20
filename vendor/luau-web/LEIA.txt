@@ -1,0 +1,1 @@
+luau-web 1.5.1 (npm, MIT, github.com/xNasuni/luau-web): Luau em WebAssembly para o navegador. Copiado sem mudar.
