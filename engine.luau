@@ -1407,7 +1407,7 @@ local function strike(
 		for _, effect in effects(attacker, "MaxHpHit") do
 			share += effect.Percent or 0
 		end
-		-- Chefão do rodízio (15/11/2026, pedido do usuário): só ArtifactConfig.MaxHpHitBossShare (50%) de eficácia
+		-- Chefão do rodízio (15/11/2026, pedido do usuário): só ArtifactConfig.MaxHpHitBossShare (40%; 60% menos desde 20/11/2026) de eficácia
 		share *= (target :: any).MaxHpHitShare or 1
 		if share > 0 then
 			maxHpHit = math.max(1, round(share * target.MaxHp))
@@ -2881,6 +2881,1191 @@ BattleEngine.Core = {
 
 return BattleEngine
 ]=]
+SOURCES["src/server/Events/BrawlSkills.luau"] = [=[
+--[[
+	BrawlSkills — as habilidades (passivas de SpeciesConfig) valendo na briga do Coliseu, em tempo real.
+
+	As mesmas regras da luta por turnos (Combat/BattleEngine), com "1 turno" = BrawlConfig.Skills.TurnSeconds.
+	A Vida de briga vem do papel, então porcentagens de Vida usam a Vida de briga e os multiplicadores
+	valem sobre o dano do papel. Só regras: quem desenha e guarda é o BrawlService, que passa o "ctx":
+
+		ctx.rng                          → Random
+		ctx.enemiesNear(unit, raio)      → brainrots inimigos de pé até esse raio
+		ctx.allies(unit)                 → o time dele (inclusive ele)
+		ctx.emit(unit, nome, fx?, golpe?) → avisa os clientes (nome da habilidade, efeito especial)
+		ctx.changed(unit)                → a Vida mudou (guardar)
+		ctx.onKo(quemBateu?, alvo)       → nocauteado
+		ctx.onRevive(unit)               → usou a Revive (só uma vez até curar no terreno)
+
+	Tipos: AttackPattern, AttackStacking, Burn, Crit, DamageReduction, Debuff, Dodge, ExtraAttack,
+	HealPerTurn, Initiative, Lifesteal, Reflect, Revive, Shield, Stun, TeamHeal, TeamShield, TeamShieldEvery.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Shared = ReplicatedStorage.Shared
+local ComboTiming = require(Shared.Brainrot.ComboTiming)
+local BattleFxConfig = require(Shared.Config.BattleFxConfig)
+local ArtifactConfig = require(Shared.Config.ArtifactConfig)
+local BrawlConfig = require(Shared.Config.BrawlConfig)
+local CombatConfig = require(Shared.Config.CombatConfig)
+local SpeciesConfig = require(Shared.Config.SpeciesConfig)
+local PassivePower = require(Shared.Brainrot.PassivePower)
+
+local SKILLS = BrawlConfig.Skills
+
+local BrawlSkills = {}
+
+-- Za Warudo sai neste ataque? Com First (Lirilì; 13/11/2026, pedido do usuário): no 1º ataque e depois a cada Every
+-- (1º, 5º, 9º... com Every 4); sem First: no Every-ésimo (4º, 8º...). Os golpes da própria habilidade não contam
+local function timeStopFires(effect: any, attacks: number): boolean
+	local every = effect.Every or 0
+	if every <= 0 or attacks <= 0 then
+		return false
+	end
+	return if effect.First then (attacks - 1) % every == 0 else attacks % every == 0
+end
+
+local function effects(unit: any, kind: string): { any }
+	return unit.Effects[kind] or {}
+end
+
+local function roll(ctx: any, chance: number?): boolean
+	return ctx.rng:NextNumber() < (chance or 1)
+end
+
+local function debuffFactor(unit: any, stat: string, now: number): number
+	-- Lentidão (17/11/2026, igual ao BattleEngine): só a mais forte vale; as outras esperam o tempo delas
+	local factor, strongest = 1, 0
+	for _, debuff in unit.Debuffs do
+		if debuff.Stat == stat and debuff.Until > now then
+			if stat == "Spd" then
+				strongest = math.max(strongest, debuff.Percent)
+			else
+				factor *= 1 - debuff.Percent
+			end
+		end
+	end
+	return math.max(SKILLS.MinStatFactor, factor * (1 - strongest))
+end
+
+-- Monta os campos das habilidades em um brainrot da briga (passiveId = id da espécie dona da passiva)
+-- stars = estrelas do brainrot: a passiva cresce com elas (PassivePower, 13/11/2026)
+function BrawlSkills.attach(
+	unit: any,
+	passiveId: string,
+	revivesUsed: number,
+	artifactEffects: { any }?,
+	stars: number?
+)
+	local species = SpeciesConfig.get(passiveId)
+	local passive = species and species.Passive
+	local grouped: { [string]: { any } } = {}
+	for _, effect in if species then PassivePower.effects(species, stars) else {} do
+		grouped[effect.Type] = grouped[effect.Type] or {}
+		table.insert(grouped[effect.Type], effect)
+	end
+	for _, effect in artifactEffects or {} do
+		grouped[effect.Type] = grouped[effect.Type] or {}
+		table.insert(grouped[effect.Type], effect)
+	end
+	unit.PassiveId = passiveId
+	unit.PassiveName = if passive then passive.Name else ""
+	unit.PassiveFx = passive and passive.Fx
+	unit.Effects = grouped
+	unit.Attacks = unit.Attacks or 0
+	unit.Fury = unit.Fury or 0
+	unit.Shield = unit.Shield or 0
+	unit.PendingBonus = unit.PendingBonus or 0
+	unit.StunUntil = unit.StunUntil or 0
+	unit.StunImmuneUntil = unit.StunImmuneUntil or 0
+	unit.Vulnerable = unit.Vulnerable or 0
+	unit.Debuffs = unit.Debuffs or {}
+	unit.Queue = unit.Queue or {}
+	unit.Revives = revivesUsed
+	unit.InitiativeHits = unit.InitiativeHits or 0
+	unit.HealTimer = unit.HealTimer or 0
+	unit.BurnUntil = unit.BurnUntil or 0
+	unit.BurnPercent = unit.BurnPercent or 0
+	unit.BurnTimer = unit.BurnTimer or 0
+end
+
+-- Velocidade para andar e bater
+-- Segundos até o próximo ataque: a mesma reta da Arena pela Velocidade do brainrot (unit.Spd, posto pelo
+-- BrawlService) × lentidão/SpdUp (13/11/2026, pedido do usuário; antes era o Interval do papel ÷ esses efeitos)
+function BrawlSkills.attackInterval(unit: any, now: number): number
+	return CombatConfig.attackInterval(
+		(unit.Spd or CombatConfig.RealtimeAttack.Low.Spd) * BrawlSkills.speedFactor(unit, now)
+	)
+end
+
+function BrawlSkills.speedFactor(unit: any, now: number): number
+	local bonus = 0
+	if unit.InitiativeHits > 0 then
+		local initiative = effects(unit, "Initiative")[1]
+		bonus = if initiative then initiative.SpeedBonus or 0 else 0
+	end
+	return debuffFactor(unit, "Spd", now) * (1 + bonus)
+end
+
+-- Ícones de status do brainrot na briga (16/11/2026; ids do StatusConfig, iguais aos da luta por turnos). Turns = turnos
+-- de briga que faltam (TurnSeconds cada), 0 = sem fim
+function BrawlSkills.statusOf(unit: any, now: number): { { Id: string, Percent: number, Turns: number } }
+	local list = {}
+	local function add(id: string, percent: number, untilTime: number?, inactive: boolean?)
+		local turns = if untilTime then math.max(1, math.ceil((untilTime - now) / SKILLS.TurnSeconds)) else 0
+		table.insert(
+			list,
+			{ Id = id, Percent = math.floor(percent * 100 + 0.5) / 100, Turns = turns, Inactive = inactive }
+		)
+	end
+	if (unit.Fury or 0) > 0 then
+		add("AtkUp", unit.Fury)
+	end
+	if (unit.InitiativeHits or 0) > 0 then
+		local initiative = effects(unit, "Initiative")[1]
+		if initiative and (initiative.SpeedBonus or 0) > 0 then
+			add("SpdUp", initiative.SpeedBonus)
+		end
+	end
+	if (unit.StunUntil or 0) > now then
+		add("Stun", 0, unit.StunUntil)
+	end
+	if (unit.BurnUntil or 0) > now then
+		add("Burn", unit.BurnPercent or 0, unit.BurnUntil)
+	end
+	local worst: { [string]: any } = {}
+	for _, debuff in unit.Debuffs or {} do
+		if debuff.Until > now and (not worst[debuff.Stat] or debuff.Percent > worst[debuff.Stat].Percent) then
+			worst[debuff.Stat] = debuff
+		end
+	end
+	if worst.Atk then
+		add("AtkDown", worst.Atk.Percent, worst.Atk.Until)
+	end
+	-- Lentidão (17/11/2026): um ícone por fonte; só a mais forte vale, as outras apagadas esperando
+	local slows = {}
+	for _, debuff in unit.Debuffs or {} do
+		if debuff.Stat == "Spd" and debuff.Until > now then
+			table.insert(slows, debuff)
+		end
+	end
+	table.sort(slows, function(a, b)
+		return a.Percent > b.Percent
+	end)
+	for index, debuff in slows do
+		add("SpdDown", debuff.Percent, debuff.Until, index > 1 or nil)
+	end
+	return list
+end
+
+function BrawlSkills.isStunned(unit: any, now: number): boolean
+	return unit.StunUntil > now
+end
+
+function BrawlSkills.isBurning(unit: any, now: number): boolean
+	return unit.BurnUntil > now
+end
+
+local function heal(ctx: any, unit: any, amount: number)
+	if unit.Ko or amount <= 0 or unit.Hp >= unit.MaxHp then
+		return
+	end
+	unit.Hp = math.min(unit.MaxHp, unit.Hp + amount)
+	ctx.changed(unit)
+end
+
+-- Maçã (artefato): conta os golpes que acertaram, dados ou levados; a cada Every, cura Percent da Vida máxima
+-- Com Dealt (Trulimero, 14/11/2026): só os golpes que ELE deu contam. dealt = este golpe foi dele
+local function countHit(ctx: any, unit: any, dealt: boolean)
+	local list = effects(unit, "HealEveryHits")
+	if #list == 0 then
+		return
+	end
+	unit.HitCount = (unit.HitCount or 0) + 1
+	if dealt then
+		unit.DealtCount = (unit.DealtCount or 0) + 1
+	end
+	for _, effect in list do
+		local count = if effect.Dealt then (if dealt then unit.DealtCount else 0) else unit.HitCount
+		if (effect.Every or 0) > 0 and count > 0 and count % effect.Every == 0 and not unit.Ko then
+			heal(ctx, unit, (effect.Percent or 0) * unit.MaxHp)
+			ctx.emit(unit, effect.Name or unit.PassiveName, if effect.Name then "ArtifactHeal" else "Heal")
+		end
+	end
+end
+
+-- Tira Vida (o escudo absorve antes); cuida da Revive e do nocaute. Roubo de vida de quem causou vale em TODO dano
+-- (14/11/2026, pedido do usuário): golpe, Jakalopita, Julgamento, espinhos, escudo que explode e queimadura
+-- Penetração (Chamas de Goes, efeito Pierce; 15/11/2026), igual ao motor: soma do campo de quem bate, até 100%
+local function pierceOf(unit: any, field: string): number
+	local total = 0
+	for _, effect in effects(unit, "Pierce") do
+		total += effect[field] or 0
+	end
+	return math.min(1, total)
+end
+
+local function damage(ctx: any, source: any?, target: any, amount: number)
+	if source and source ~= target and not source.Ko and amount > 0 then
+		for _, effect in effects(source, "Lifesteal") do
+			heal(ctx, source, (effect.Percent or 0) * amount)
+		end
+	end
+	-- Escudo (07/11/2026): com qualquer escudo, o golpe inteiro bate só nele (o que sobra se perde)
+	-- Penetração de escudo de quem bateu (Chamas de Goes, 16/11/2026, pedido do usuário): esta fração do golpe vai
+	-- direto na Vida, o resto bate no escudo (40% = 40% na Vida e 60% no escudo)
+	local absorbed = if target.Shield > 0 then amount else 0
+	if absorbed > 0 then
+		local pierce = if source and source ~= target then pierceOf(source, "ShieldPierce") else 0
+		absorbed = amount * (1 - pierce)
+		target.Shield = math.max(0, target.Shield - absorbed)
+	end
+	target.Hp -= amount - absorbed
+	if target.Hp <= 0 then
+		local revive = effects(target, "Revive")[1]
+		if revive and target.Revives < (revive.Uses or 1) then
+			target.Revives += 1
+			target.Hp = math.max(1, (revive.Percent or 0) * target.MaxHp)
+			target.BurnUntil = 0
+			target.StunUntil = 0
+			table.clear(target.Debuffs)
+			target.Vulnerable = 0
+			target.Fury += revive.Fury or 0
+			ctx.onRevive(target)
+			ctx.emit(target, target.PassiveName)
+		else
+			target.Hp = 0
+			target.Ko = true
+			target.Queue = {}
+			ctx.onKo(source, target)
+		end
+	end
+	ctx.changed(target)
+	if target.Ko or target.Hp <= 0 then
+		return
+	end
+	-- Levou dano e está de pé (13/11/2026, igual ao motor, BattleEngine onHurt):
+	--   HurtCharge (Pirueta): o próximo ataque dá Multiplier o dano
+	--   LowHpRush (Sem Sinal): a Vida caiu abaixo de uma marca (Thresholds) → o tempo do ataque recomeça do zero
+	for _, effect in effects(target, "HurtCharge") do
+		local multiplier = effect.Multiplier or 1
+		if multiplier > (target.Charged or 1) then
+			target.Charged = multiplier
+		end
+	end
+	for _, effect in effects(target, "LowHpRush") do
+		target.RushCrossed = target.RushCrossed or {}
+		-- Na briga a Vida fica guardada entre as entradas: marca que a Vida voltou a passar (cura) fica pronta de novo
+		if PassivePower.crossThresholds(effect, target.RushCrossed, target.Hp / target.MaxHp, true) then
+			target.Cooldown = 0
+			ctx.emit(target, target.PassiveName, target.PassiveFx)
+		end
+	end
+end
+
+local function tryStun(ctx: any, source: any, target: any, turns: number, now: number, vulnerable: number?)
+	if target.StunImmuneUntil > now or target.Ko then
+		return
+	end
+	target.Vulnerable = vulnerable or 0
+	local seconds = turns * SKILLS.TurnSeconds
+	target.StunUntil = now + seconds
+	target.StunImmuneUntil = now + seconds + SKILLS.StunImmuneSeconds
+	ctx.emit(source, source.PassiveName)
+end
+
+local function addDebuff(ctx: any, source: any, target: any, effect: any, now: number): boolean
+	local key = `{source.PassiveId}:{effect.Stat or "Atk"}`
+	-- Nada dura para sempre (12/11/2026, CombatConfig.MinDebuffTurns)
+	local turns = math.max(CombatConfig.MinDebuffTurns, math.floor(tonumber(effect.Turns) or 0))
+	local untilTime = now + turns * SKILLS.TurnSeconds
+	local existing = target.Debuffs[key]
+	if existing and existing.Until >= untilTime then
+		return false
+	end
+	target.Debuffs[key] = { Stat = effect.Stat or "Atk", Percent = effect.Percent or 0, Until = untilTime }
+	ctx.emit(source, source.PassiveName)
+	return true
+end
+
+local function onHit(ctx: any, attacker: any, target: any, stunTurns: number?, now: number)
+	if stunTurns and stunTurns > 0 then
+		tryStun(ctx, attacker, target, stunTurns, now)
+	end
+	for _, effect in effects(attacker, "Stun") do
+		if roll(ctx, effect.Chance) then
+			tryStun(ctx, attacker, target, effect.Turns or 1, now, effect.Vulnerable)
+		end
+	end
+	for _, effect in effects(attacker, "Burn") do
+		if roll(ctx, effect.Chance) then
+			target.BurnUntil = now + (effect.Turns or 1) * SKILLS.TurnSeconds
+			target.BurnPercent = effect.Percent or 0
+			target.BurnSource = attacker
+			ctx.emit(attacker, attacker.PassiveName)
+		end
+	end
+	for _, effect in effects(attacker, "Debuff") do
+		if not effect.AtStart and roll(ctx, effect.Chance) then
+			addDebuff(ctx, attacker, target, effect, now)
+		end
+	end
+end
+
+type StrikeOptions = {
+	Multiplier: number?,
+	ForcedCrit: number?,
+	StunTurns: number?,
+	Push: boolean?,
+	NoReaction: boolean?, -- contra-ataque: não pode ser esquivado nem aplica efeitos
+	Basic: boolean?, -- ataque básico (não é passo de habilidade): o que o RetaliateDebuff do alvo responde
+	Wave: {}?, -- o mesmo golpe em área (todos os alvos dele): o Julgamento de Eyros sai em todos, com 33%
+}
+
+local riposte: (any, any, any, number) -> ()
+
+-- Velocidade das habilidades (19/11/2026, pedido do usuário): até 1 ataque/s = 1; acima disso as pancadas e as
+-- animações aceleram na mesma proporção (2 ataques/s = 2x). O cliente recebe no BrawlSkill (BrawlController)
+function BrawlSkills.animRate(unit: any, now: number): number
+	return math.max(1, 1 / BrawlSkills.attackInterval(unit, now))
+end
+
+-- Segundos depois do começo do golpe em que a pancada `hit` acerta. Pulo na Cabeça (Fx "HeadJump", Chimpanzini): cada
+-- pulo cai a Seconds/Hops do anterior, e o dano sai quando ele TOCA o alvo, inclusive no 1º (13/11/2026: o 1º saía
+-- quando o pulo começava); os outros, no ritmo das animações (ComboTiming)
+local function hitDelay(unit: any, step: any?, hit: number): number
+	if step and step.Fx == "HeadJump" then
+		local jump = BattleFxConfig.HeadJump
+		return hit * jump.Seconds / jump.Hops
+	end
+	return ComboTiming.offset(unit.Species or "", hit) / BrawlSkills.animRate(unit, os.clock())
+end
+
+-- Casca de Coco: conta um golpe dado ou levado (definida perto do attack)
+local shellCount: (any, any, number, any?) -> ()
+
+local function strike(ctx: any, attacker: any, target: any, now: number, options: StrikeOptions)
+	if attacker.Ko or target.Ko then
+		return
+	end
+	-- Enfraquecimento "de início da luta": vale do primeiro golpe em cada inimigo em diante
+	for _, effect in effects(attacker, "Debuff") do
+		if effect.AtStart then
+			addDebuff(ctx, attacker, target, effect, now)
+		end
+	end
+	if not options.NoReaction then
+		-- Esquiva garantida do 1º golpe (Golpe Ninja): um crítico dele deixa pronta de novo (até Recharges vezes)
+		if effects(target, "FirstDodge")[1] and not target.FirstDodgeSpent then
+			target.FirstDodgeSpent = true
+			ctx.emit(target, target.PassiveName, "Dodge")
+			riposte(ctx, target, attacker, now)
+			return
+		end
+		for _, dodge in effects(target, "Dodge") do
+			if roll(ctx, dodge.Chance) then
+				ctx.emit(target, target.PassiveName, "Dodge")
+				if dodge.NextAttackBonus then
+					target.PendingBonus = dodge.NextAttackBonus
+				end
+				if dodge.CounterPercent then
+					strike(ctx, target, attacker, now, { Multiplier = dodge.CounterPercent, NoReaction = true })
+				end
+				riposte(ctx, target, attacker, now)
+				return
+			end
+		end
+	end
+
+	local role = BrawlConfig.Roles[attacker.Role]
+	local factor = math.clamp(
+		(attacker.Power / math.max(1, target.Power)) ^ BrawlConfig.PowerExponent,
+		BrawlConfig.PowerMin,
+		BrawlConfig.PowerMax
+	)
+	-- Um sorteio só, chances somadas (20/11/2026, igual ao BattleEngine)
+	local critChance, critMultiplier, critNamed = BrawlConfig.CritChance, BrawlConfig.CritMultiplier, false
+	for _, effect in effects(attacker, "Crit") do
+		critChance += effect.Chance or 0
+		critMultiplier = math.max(critMultiplier, effect.Multiplier or BrawlConfig.CritMultiplier)
+		critNamed = critNamed or (effect.Chance or 0) > 0
+	end
+	local crit, critByPassive = 1, false
+	if critChance >= 1 or roll(ctx, critChance) then
+		crit, critByPassive = critMultiplier, critNamed
+	end
+	if options.ForcedCrit and options.ForcedCrit > crit then
+		crit, critByPassive = options.ForcedCrit, true
+	end
+	for _, effect in effects(attacker, "Execute") do
+		local multiplier = effect.Multiplier or 1
+		if target.Hp <= (effect.Threshold or 0) * target.MaxHp and multiplier > crit then
+			crit, critByPassive = multiplier, true
+		end
+	end
+	if critByPassive then
+		ctx.emit(attacker, attacker.PassiveName)
+	end
+	if crit > 1 then
+		for _, effect in effects(attacker, "FirstDodge") do
+			if
+				attacker.FirstDodgeSpent
+				and (effect.Recharges == nil or (attacker.FirstDodgeRecharges or 0) < effect.Recharges)
+			then
+				attacker.FirstDodgeSpent = false
+				attacker.FirstDodgeRecharges = (attacker.FirstDodgeRecharges or 0) + 1
+			end
+		end
+	end
+	local reduction = 1
+	for _, effect in effects(target, "DamageReduction") do
+		if roll(ctx, effect.Chance) then
+			reduction *= 1 - (effect.Percent or 0)
+		end
+	end
+	-- Guarda do 1º golpe (FirstHitGuard, Blueberrini; 18/11/2026, igual ao motor): redução até levar o 1º golpe
+	local guardHit = not target.FirstHitTaken and effects(target, "FirstHitGuard")[1] ~= nil
+	if guardHit then
+		target.FirstHitTaken = true
+		for _, effect in effects(target, "FirstHitGuard") do
+			reduction *= 1 - (effect.Percent or 0)
+		end
+	end
+	-- Penetração de redução de dano (Chamas de Goes): tira esta fração da redução que sobrou depois do teto
+	local guarded = math.max(1 - CombatConfig.MaxDamageReduction, reduction) -- teto universal de 90% (15/11/2026)
+	guarded += (1 - guarded) * pierceOf(attacker, "ReductionPierce")
+	local variation = ctx.rng:NextNumber(BrawlConfig.Variation[1], BrawlConfig.Variation[2])
+	local amount = role.Damage
+		* factor
+		* variation
+		* crit
+		* guarded
+		* (options.Multiplier or 1)
+		* (1 + attacker.Fury)
+		* debuffFactor(attacker, "Atk", now)
+		* (if target.StunUntil > now then 1 + target.Vulnerable else 1)
+	-- Espinhos são pré-mitigação (18/11/2026, pedido do usuário): contam sobre o golpe sem a redução de dano do alvo
+	local unreduced = if guarded > 0 then amount / guarded else amount
+	local hpBefore = target.Hp -- espinhos devolvem no máximo isto (07/11/2026)
+	local hadShield = target.Shield > 0
+	damage(ctx, attacker, target, amount)
+	-- Crítico (16/11/2026, pedido do usuário): a tela mostra o número laranja com o ícone (aviso "Crit" no ALVO, com a
+	-- Vida que ele perdeu de verdade; o escudo que segurou tudo não conta). Golpe que derruba não tem número
+	if crit > 1 and not target.Ko then
+		local lost = hpBefore - target.Hp
+		if lost >= 1 then
+			ctx.emit(target, "", "Crit", math.floor(lost + 0.5))
+		end
+	end
+	-- Jakalopita (artefato, MaxHpHit; 13/11/2026): mais Percent da Vida máxima do alvo, à parte; a tela mostra o número
+	-- roxo pelo aviso "MaxHpHit" (emit no ALVO, com o valor no lugar do golpe)
+	if not target.Ko then
+		local share = 0
+		for _, effect in effects(attacker, "MaxHpHit") do
+			share += effect.Percent or 0
+		end
+		if share > 0 then
+			local extra = math.max(1, share * target.MaxHp)
+			damage(ctx, attacker, target, extra)
+			ctx.emit(target, "", "MaxHpHit", math.floor(extra + 0.5))
+		end
+	end
+	-- Julgamento de Eyros (artefato, FirstStrike; 14/11/2026): durante o 1º "turno" deste brainrot na briga (um
+	-- TurnSeconds a partir do 1º golpe dele, FirstStrikeAt), todo golpe tira mais Percent × o dano base dele, à parte;
+	-- número amarelo pelo aviso "FirstStrike". Ataque básico num alvo só: inteiro; habilidade ou área: FirstStrikeAreaShare
+	attacker.FirstStrikeAt = attacker.FirstStrikeAt or now
+	if not target.Ko and now - attacker.FirstStrikeAt <= SKILLS.TurnSeconds then
+		local share = 0
+		for _, effect in effects(attacker, "FirstStrike") do
+			share += effect.Percent or 0
+		end
+		if share > 0 then
+			local full = options.Basic == true and options.Wave == nil
+			local efficacy = if full then 1 else ArtifactConfig.FirstStrikeAreaShare
+			local extra = math.max(1, share * efficacy * role.Damage)
+			damage(ctx, attacker, target, extra)
+			ctx.emit(target, "", "FirstStrike", math.floor(extra + 0.5))
+		end
+	end
+
+	if options.Push then
+		local away = target.Position - attacker.Position
+		away = Vector3.new(away.X, 0, away.Z)
+		local direction = if away.Magnitude > 0.01
+			then away.Unit
+			else Vector3.new(ctx.rng:NextNumber(-1, 1), 0, ctx.rng:NextNumber(-1, 1) + 0.01).Unit
+		local studs = BrawlConfig.PushStuds
+			* math.clamp(factor, BrawlConfig.PushMin, BrawlConfig.PushMax)
+			* (if crit > 1 then 2 else 1)
+		target.Velocity = direction * (studs / BrawlConfig.PushTime)
+		target.PushUntil = now + BrawlConfig.PushTime
+	end
+
+	-- Espinhos: devolvem uma parte do dano recebido, em TODO golpe (até revide e contra-ataque; 07/11/2026). É dano direto (não é golpe): não ativa os espinhos de quem
+	-- levou de volta, senão os dois ficariam se rebatendo para sempre
+	for _, effect in effects(target, "Reflect") do
+		if not attacker.Ko then
+			local percent = effect.Percent or 0
+			if percent > 0 then
+				-- sempre pelo menos 1 e no máximo a Vida que ele tinha antes do golpe (07/11/2026)
+				local thorns = math.max(1, math.min(percent * unreduced, hpBefore))
+				-- Espinhos passam pela redução de dano de quem bateu (19/11/2026, pedido do usuário; teto de 90%)
+				local kept = 1
+				for _, guard in effects(attacker, "DamageReduction") do
+					if (guard.Chance or 1) >= 1 then
+						kept *= 1 - (guard.Percent or 0)
+					end
+				end
+				thorns = math.max(1, thorns * math.max(1 - CombatConfig.MaxDamageReduction, kept))
+				damage(ctx, target, attacker, thorns)
+				ctx.emit(target, target.PassiveName, "ThornBurst")
+				-- O número laranja em quem bateu (15/11/2026, como o "MaxHpHit": no ALVO dos espinhos, com o valor)
+				ctx.emit(attacker, "", "Thorns", math.floor(thorns + 0.5))
+			end
+		end
+	end
+	countHit(ctx, attacker, true)
+	countHit(ctx, target, false)
+	-- Levou um golpe: conta para a Casca de Coco (Burbaloni) e pode entrar no coco na hora
+	shellCount(ctx, target, now, attacker)
+	-- Guarda do 1º golpe: de pé, revida (Multiplier × um golpe normal dele) e atordoa quem bateu por StunTurns turnos
+	if guardHit and not target.Ko and not attacker.Ko then
+		for _, effect in effects(target, "FirstHitGuard") do
+			strike(ctx, target, attacker, now, { Multiplier = effect.Multiplier or 1, NoReaction = true })
+			if (effect.StunTurns or 0) > 0 and not attacker.Ko then
+				tryStun(ctx, target, attacker, effect.StunTurns, now)
+			end
+		end
+	end
+	if not options.NoReaction then
+		-- Escudo que estoura pode explodir em quem quebrou
+		if hadShield and target.Shield <= 0 and not attacker.Ko then
+			for _, effect in effects(target, "Shield") do
+				if (effect.BreakHpDamage or 0) > 0 then
+					damage(ctx, target, attacker, (effect.BreakHpDamage or 0) * target.MaxHp)
+					ctx.emit(target, target.PassiveName)
+				end
+			end
+		end
+		if not target.Ko then
+			onHit(ctx, attacker, target, options.StunTurns, now)
+			for _, effect in effects(target, "Trap") do
+				if not attacker.Ko and roll(ctx, effect.Chance) then
+					tryStun(ctx, target, attacker, effect.Turns or 1, now)
+				end
+			end
+		end
+		-- Ataque básico nele: quem bateu leva o enfraquecimento (RetaliateDebuff; Patapim, 14/11/2026)
+		if options.Basic and not attacker.Ko then
+			for _, effect in effects(target, "RetaliateDebuff") do
+				if roll(ctx, effect.Chance or 1) then
+					addDebuff(ctx, target, attacker, effect, now)
+				end
+			end
+		end
+	end
+end
+
+-- Revide de quem esquivou (DodgeRiposte, Cappuccino Assassino): na briga não há Ataque, então é um golpe de
+-- Multiplier × um golpe normal dele (sem reação)
+riposte = function(ctx: any, dodger: any, attacker: any, now: number)
+	for _, effect in effects(dodger, "DodgeRiposte") do
+		-- Limit = revides por luta (16/11/2026); a esquiva continua depois disso
+		if effect.Limit and (dodger.RipostesUsed or 0) >= effect.Limit then
+			continue
+		end
+		dodger.RipostesUsed = (dodger.RipostesUsed or 0) + 1
+		strike(ctx, dodger, attacker, now, { Multiplier = effect.Multiplier or 1, NoReaction = true })
+		-- 17/11/2026 (igual ao BattleEngine): o parry paralisa quem levou o revide
+		if (effect.StunTurns or 0) > 0 and not attacker.Ko then
+			tryStun(ctx, dodger, attacker, effect.StunTurns, now)
+		end
+	end
+end
+
+-- Igual ao motor (BattleEngine extraFires): com Every, garantido no 1º ataque e a cada Every; sem, sorteio de Chance
+-- 15/11/2026 (pedido do usuário): o de Every é a habilidade do turno, no lugar do golpe (everyExtra); aqui só o de Chance
+local function extraFires(ctx: any, _unit: any, effect: any, _before: boolean, _count: number): boolean
+	if effect.Every then
+		return false
+	end
+	return roll(ctx, effect.Chance)
+end
+
+-- Onda de Every (Orcalero): no 1º ataque e depois a cada Every, NO LUGAR do golpe. deal = golpe na piñata (bagAttack)
+local function everyExtra(ctx: any, unit: any, target: any?, now: number, deal: ((number) -> ())?): boolean
+	local fired = false
+	for _, effect in effects(unit, "ExtraAttack") do
+		if effect.Every and (unit.Attacks - 1) % effect.Every == 0 then
+			fired = true
+			ctx.emit(unit, unit.PassiveName, effect.Fx)
+			if deal then
+				deal(effect.Multiplier or 1)
+			elseif effect.AllTargets then
+				local wave = {}
+				for _, foe in ctx.enemiesNear(unit, SKILLS.AreaRadius) do
+					strike(ctx, unit, foe, now, { Multiplier = effect.Multiplier or 1, Wave = wave })
+				end
+			elseif target then
+				strike(ctx, unit, target, now, { Multiplier = effect.Multiplier or 1 })
+			end
+		end
+	end
+	return fired
+end
+
+-- Fúria (AttackStacking): +PerTurn a cada ataque, até Max
+local function stackFury(ctx: any, unit: any)
+	for _, effect in effects(unit, "AttackStacking") do
+		local before = unit.Fury
+		unit.Fury = math.min(effect.Max or 0, unit.Fury + (effect.PerTurn or 0))
+		if unit.Fury > before then
+			ctx.emit(unit, unit.PassiveName)
+		end
+	end
+end
+
+-- Za Warudo: na briga, golpes seguidos que o alvo não consegue esquivar; NO LUGAR do golpe (15/11/2026). deal = piñata
+local function zaWarudo(ctx: any, unit: any, target: any?, deal: ((number) -> ())?): boolean
+	local fired = false
+	for _, effect in effects(unit, "TimeStop") do
+		if timeStopFires(effect, unit.Attacks) and (deal or (target and not target.Ko)) then
+			fired = true
+			ctx.emit(unit, unit.PassiveName, "TimeStop")
+			-- AllTargets (Lirilì; 13/11/2026): na briga, todo brainrot inimigo de pé no Coliseu
+			local victims = if deal
+				then {}
+				elseif (effect :: any).AllTargets then ctx.enemiesNear(unit, math.huge)
+				else { target }
+			-- 13/11/2026 (pedido do usuário): o 1º golpe 0,5 s depois do grito e os outros a cada 0,25 s
+			-- (CombatConfig.TimeStopHits); todos os alvos juntos em cada golpe
+			local timing = CombatConfig.TimeStopHits
+			for action = 1, effect.Actions or 1 do
+				task.delay(timing.Delay + (action - 1) * timing.Gap, function()
+					if unit.Ko then
+						return
+					end
+					if deal then
+						deal(effect.Multiplier or 1)
+						return
+					end
+					local wave = {}
+					for _, victim in victims do
+						if not victim.Ko then
+							strike(
+								ctx,
+								unit,
+								victim,
+								os.clock(),
+								{ Multiplier = effect.Multiplier or 1, NoReaction = true, Wave = wave }
+							)
+						end
+					end
+				end)
+			end
+		end
+	end
+	return fired
+end
+
+local function extraAttacks(ctx: any, unit: any, target: any, before: boolean, now: number)
+	for _, effect in effects(unit, "ExtraAttack") do
+		local count = 0
+		while
+			(effect.Before == true) == before
+			and count < (effect.Chain or 1)
+			and extraFires(ctx, unit, effect, before, count)
+		do
+			count += 1
+			if effect.AllTargets then
+				ctx.emit(unit, unit.PassiveName, effect.Fx)
+				local wave = {}
+				for _, foe in ctx.enemiesNear(unit, SKILLS.AreaRadius) do
+					strike(ctx, unit, foe, now, { Multiplier = effect.Multiplier or 1, Wave = wave })
+				end
+			else
+				ctx.emit(unit, unit.PassiveName, effect.Fx)
+				strike(ctx, unit, target, now, { Multiplier = effect.Multiplier or 1 })
+			end
+		end
+	end
+end
+
+local function patternStep(unit: any): any?
+	local effect = effects(unit, "AttackPattern")[1]
+	local pattern = effect and effect.Pattern
+	if not pattern then
+		return nil
+	end
+	if effect.Repeat then
+		return pattern[((unit.Attacks - 1) % #pattern) + 1]
+	end
+	return pattern[unit.Attacks]
+end
+
+-- A vez do brainrot atacar: igual a uma ação da luta por turnos
+-- Casca de Coco (CocoShell, Burbaloni; 19/11/2026, igual ao motor): depois de Every golpes somando os que deu e os que
+-- levou, entra no coco por Turns × TurnSeconds, sem atacar, com Percent de redução e Thorns de espinhos (efeitos na
+-- lista do próprio brainrot). shellBlocks: true = não ataca agora; a saída é vista na próxima tentativa de ataque
+local function shellBlocks(ctx: any, unit: any, _now: number): boolean
+	local shell = unit.Shell
+	if not shell then
+		return false
+	end
+	if shell.Hits < shell.Need then
+		return true
+	end
+	unit.Shell = nil
+	unit.ShellCount = 0
+	for kind, effect in shell.Added do
+		local list = unit.Effects[kind]
+		local index = list and table.find(list, effect)
+		if index then
+			table.remove(list, index)
+		end
+	end
+	ctx.emit(unit, "", "CocoShellOut")
+	return false
+end
+
+shellCount = function(ctx: any, unit: any, now: number, attacker: any?)
+	local effect = effects(unit, "CocoShell")[1]
+	local shell = unit.Shell
+	if shell then
+		-- 19/11/2026 (pedido do usuário): dentro do coco, cada ATAQUE levado conta uma vez (golpes do mesmo atacante no
+		-- mesmo instante, ex.: rajada do Bobrito, = 1). Need ataques → sai na próxima vez dele (shellBlocks)
+		if attacker and (shell.LastBy ~= attacker or shell.LastAt ~= now) then
+			shell.LastBy, shell.LastAt = attacker, now
+			shell.Hits += 1
+		end
+		return
+	end
+	if not effect or unit.Ko then
+		return
+	end
+	unit.ShellCount = (unit.ShellCount or 0) + 1
+	if unit.ShellCount < (effect.Every or 2) then
+		return
+	end
+	unit.ShellCount = 0
+	local added = {
+		DamageReduction = { Type = "DamageReduction", Percent = effect.Percent or 0, Chance = 1, Silent = true },
+		Reflect = { Type = "Reflect", Percent = effect.Thorns or 0, Silent = true },
+	}
+	for kind, extra in added do
+		unit.Effects[kind] = unit.Effects[kind] or {}
+		table.insert(unit.Effects[kind], extra)
+	end
+	unit.Shell = { Hits = 0, Need = math.max(1, effect.Turns or 2), LastBy = nil, LastAt = now, Added = added }
+	ctx.emit(unit, unit.PassiveName, "CocoShellIn") -- "CocoShell" sozinho é o efeito genérico da passiva (PassiveFx)
+end
+
+local function attackTurn(ctx: any, unit: any, target: any, now: number)
+	extraAttacks(ctx, unit, target, true, now)
+	if unit.Ko then
+		return
+	end
+
+	unit.Attacks += 1
+	for _, effect in effects(unit, "TeamShieldEvery") do
+		if unit.Attacks % (effect.Every or 1) == 0 then
+			for _, ally in ctx.allies(unit) do
+				if not ally.Ko then
+					ally.Shield += (effect.Percent or 0) * (if effect.OwnMaxHp then ally.MaxHp else unit.MaxHp)
+				end
+			end
+			ctx.emit(unit, unit.PassiveName, "Shield")
+		end
+	end
+	for _, effect in effects(unit, "TeamHeal") do
+		if unit.Attacks % (effect.Every or 1) == 0 then
+			local worst = nil
+			for _, ally in ctx.allies(unit) do
+				if
+					not ally.Ko
+					and ally.Hp < ally.MaxHp
+					and (not worst or ally.Hp / ally.MaxHp < worst.Hp / worst.MaxHp)
+				then
+					worst = ally
+				end
+			end
+			if worst then
+				heal(ctx, worst, (effect.Percent or 0) * unit.MaxHp)
+				ctx.emit(unit, unit.PassiveName, "Heal")
+			end
+		end
+	end
+
+	-- Turno de habilidade (15/11/2026, pedido do usuário): Za Warudo e onda de Every SÃO o ataque, no lugar do golpe
+	if zaWarudo(ctx, unit, target) or everyExtra(ctx, unit, target, now) then
+		stackFury(ctx, unit)
+		local interval = BrawlSkills.attackInterval(unit, now)
+		if unit.InitiativeHits > 0 then
+			unit.InitiativeHits -= 1
+		end
+		unit.Cooldown = interval + hitDelay(unit, nil, 1)
+		unit.Hitting = true
+		return
+	end
+
+	local step = patternStep(unit)
+	local special = step ~= nil and next(step) ~= nil
+	local bonus = unit.PendingBonus
+	unit.PendingBonus = 0
+	-- Pirueta (HurtCharge): levou dano antes → este ataque dá Charged o dano
+	local charge = unit.Charged or 1
+	unit.Charged = nil
+	if charge > 1 and not special then
+		ctx.emit(unit, unit.PassiveName)
+	end
+	local hits = if step and step.Hits then step.Hits else 1
+	local baseMultiplier = (1 + bonus) * charge
+	local forcedCrit = nil
+	if step then
+		if step.Crit then
+			forcedCrit = step.Multiplier or BrawlConfig.CritMultiplier
+		else
+			baseMultiplier *= step.Multiplier or 1
+		end
+	end
+	if special then
+		ctx.emit(
+			unit,
+			unit.PassiveName,
+			step and step.Fx,
+			if step and step.Fx then 1 else nil,
+			target.Position -- no chão, embaixo do alvo (07/11/2026)
+		)
+	end
+	local multiplier = baseMultiplier
+	if step and step.FinalMultiplier and hits == 1 then
+		multiplier *= step.FinalMultiplier
+	end
+	if step and step.AllTargets then
+		local wave = {}
+		for _, foe in ctx.enemiesNear(unit, SKILLS.AreaRadius) do
+			strike(ctx, unit, foe, now, { Multiplier = multiplier, Wave = wave })
+			-- Enfraquecimento do passo (pneu da Boneca: -30% de Velocidade por 2 turnos)
+			if step.Debuff and not foe.Ko then
+				addDebuff(ctx, unit, foe, step.Debuff, now)
+			end
+		end
+	elseif step and step.Fx == "HeadJump" then
+		-- O 1º pulo também espera tocar o alvo (vai para a fila, sem aviso: o aviso do começo já saiu)
+		table.insert(
+			unit.Queue,
+			{ At = now + hitDelay(unit, step, 1), Target = target, Hit = 1, Multiplier = multiplier }
+		)
+	else
+		strike(ctx, unit, target, now, {
+			Multiplier = multiplier,
+			ForcedCrit = forcedCrit,
+			StunTurns = if step then step.StunTurns else nil,
+			Push = true,
+			Basic = not special,
+		})
+	end
+	-- Os outros golpes do padrão saem em seguida (BrawlSkills.runQueue)
+	for hit = 2, hits do
+		local final = if step and step.FinalMultiplier and hit == hits then step.FinalMultiplier else 1
+		table.insert(unit.Queue, {
+			-- No ritmo das animações de verdade (ComboTiming; 07/11/2026: a cada 0,3 s uma cortava a outra)
+			At = now + hitDelay(unit, step, hit),
+			Target = target,
+			Hit = hit,
+			Multiplier = baseMultiplier * final,
+			Fx = step and step.Fx,
+		})
+	end
+	if step and step.HealPercent then
+		heal(ctx, unit, step.HealPercent * unit.MaxHp)
+	end
+	if not unit.Ko and not target.Ko then
+		extraAttacks(ctx, unit, target, false, now)
+	end
+	stackFury(ctx, unit)
+
+	local interval = BrawlSkills.attackInterval(unit, now) -- antes de gastar o golpe do SpdUp
+	if unit.InitiativeHits > 0 then
+		unit.InitiativeHits -= 1
+	end
+	unit.Cooldown = interval + hitDelay(unit, step, hits)
+	unit.Hitting = true
+end
+
+function BrawlSkills.attack(ctx: any, unit: any, target: any, now: number)
+	if shellBlocks(ctx, unit, now) then
+		return
+	end
+	attackTurn(ctx, unit, target, now)
+	-- O ataque dele conta para a Casca de Coco
+	shellCount(ctx, unit, now)
+end
+
+-- Golpe em um alvo de evento (piñata): as habilidades de ataque valem e viram multiplicador em deal(multiplicador).
+-- artificial(tipo) (14/11/2026, Patapim): a cada golpe, os itens que dariam dano à parte avisam ("MaxHpHit" da Jakalopita,
+-- "FirstStrike" do Julgamento no 1º turno da janela); o alvo decide quanto vale
+-- dealHit(multiplicador, básico): básico = o golpe comum, sem padrão de habilidade (gráfico de dano da Piñata, 16/11/2026)
+function BrawlSkills.bagAttack(
+	ctx: any,
+	unit: any,
+	now: number,
+	dealHit: (number, boolean) -> (),
+	artificial: ((string) -> ())?
+)
+	local function deal(multiplier: number, basic: boolean?)
+		dealHit(multiplier, basic == true)
+		if not artificial then
+			return
+		end
+		local clock = os.clock()
+		if #effects(unit, "MaxHpHit") > 0 then
+			artificial("MaxHpHit")
+		end
+		if #effects(unit, "FirstStrike") > 0 then
+			unit.FirstStrikeAt = unit.FirstStrikeAt or clock
+			if clock - unit.FirstStrikeAt <= SKILLS.TurnSeconds then
+				artificial("FirstStrike")
+			end
+		end
+	end
+	local function extras(before: boolean)
+		for _, effect in effects(unit, "ExtraAttack") do
+			local count = 0
+			while
+				(effect.Before == true) == before
+				and count < (effect.Chain or 1)
+				and extraFires(ctx, unit, effect, before, count)
+			do
+				count += 1
+				ctx.emit(unit, unit.PassiveName, effect.Fx)
+				deal(effect.Multiplier or 1)
+			end
+		end
+	end
+	extras(true)
+	unit.Attacks += 1
+	countHit(ctx, unit, true)
+	-- Turno de habilidade (15/11/2026): Za Warudo e onda de Every no lugar do golpe
+	if zaWarudo(ctx, unit, nil, deal) or everyExtra(ctx, unit, nil, now, deal) then
+		stackFury(ctx, unit)
+		unit.Cooldown = BrawlSkills.attackInterval(unit, now) + hitDelay(unit, nil, 1)
+		unit.Hitting = true
+		return
+	end
+
+	local step = patternStep(unit)
+	local hits = if step and step.Hits then step.Hits else 1
+	-- Um sorteio só, chances somadas (20/11/2026, igual ao BattleEngine)
+	local critChance, critMultiplier, critNamed = BrawlConfig.CritChance, BrawlConfig.CritMultiplier, false
+	for _, effect in effects(unit, "Crit") do
+		critChance += effect.Chance or 0
+		critMultiplier = math.max(critMultiplier, effect.Multiplier or BrawlConfig.CritMultiplier)
+		critNamed = critNamed or (effect.Chance or 0) > 0
+	end
+	local crit = 1
+	if critChance >= 1 or roll(ctx, critChance) then
+		crit = critMultiplier
+		if critNamed then
+			ctx.emit(unit, unit.PassiveName)
+		end
+	end
+	local base = (1 + unit.PendingBonus) * (unit.Charged or 1) * (1 + unit.Fury) * debuffFactor(unit, "Atk", now)
+	unit.PendingBonus = 0
+	unit.Charged = nil
+	if step then
+		if step.Crit then
+			crit = math.max(crit, step.Multiplier or BrawlConfig.CritMultiplier)
+		else
+			base *= step.Multiplier or 1
+		end
+		if next(step) ~= nil then
+			ctx.emit(unit, unit.PassiveName, step.Fx, if step.Fx then 1 else nil, ctx.bagGround())
+		end
+		if step.HealPercent then
+			heal(ctx, unit, step.HealPercent * unit.MaxHp)
+		end
+	end
+	local multiplier = base * crit
+	local firstHit = multiplier * (if step and step.FinalMultiplier and hits == 1 then step.FinalMultiplier else 1)
+	if step and step.Fx == "HeadJump" then
+		task.delay(hitDelay(unit, step, 1), function()
+			if not unit.Ko then
+				deal(firstHit)
+			end
+		end)
+	else
+		deal(firstHit, step == nil or next(step) == nil)
+	end
+	for hit = 2, hits do
+		local final = if step and step.FinalMultiplier and hit == hits then step.FinalMultiplier else 1
+		task.delay(hitDelay(unit, step, hit), function()
+			if not unit.Ko then
+				ctx.emit(unit, unit.PassiveName, step and step.Fx, hit, ctx.bagGround())
+				deal(base * final)
+			end
+		end)
+	end
+	extras(false)
+	stackFury(ctx, unit)
+	unit.Cooldown = BrawlSkills.attackInterval(unit, now) + hitDelay(unit, step, hits)
+	unit.Hitting = true
+end
+
+-- Golpes que faltam da sequência. Retorna true se ainda está no meio dela (não anda enquanto isso).
+function BrawlSkills.runQueue(ctx: any, unit: any, now: number): boolean
+	local queued = unit.Queue[1]
+	if not queued then
+		return false
+	end
+	if queued.Target.Ko then
+		unit.Queue = {} -- o alvo caiu: as pancadas que faltavam não vão para outro
+		return false
+	end
+	if now >= queued.At then
+		table.remove(unit.Queue, 1)
+		if queued.Fx then
+			ctx.emit(unit, unit.PassiveName, queued.Fx, queued.Hit, queued.Target.Position)
+		end
+		strike(ctx, unit, queued.Target, now, { Multiplier = queued.Multiplier, Push = true })
+		unit.Hitting = true
+	end
+	return true
+end
+
+-- Habilidades "de início da luta" (escudo, escudo do time, Arrancada, golpe de abertura). Na briga não há começo: elas
+-- valem ao chegar ao Coliseu e de novo a cada SKILLS.RestartSeconds (13/11/2026, pedido do usuário). O escudo não
+-- acumula: volta a ser pelo menos o valor da habilidade
+-- Hora (os.clock) em que as habilidades de início de cada brainrot dispararam por último: dono → id → hora.
+-- Fica fora da unidade porque tirar e pôr de novo no time cria outra (18/11/2026, pedido do usuário: era um
+-- "cheese" para soltar o escudo/NUKE de novo antes dos 10 s)
+local lastStart: { [any]: { [string]: number } } = setmetatable({}, { __mode = "k" }) :: any
+
+local function startSkills(ctx: any, unit: any, allies: { any })
+	local byId = lastStart[unit.Owner] or {}
+	lastStart[unit.Owner] = byId
+	byId[unit.BrainrotId] = os.clock()
+	-- O "1º turno" do Julgamento de Eyros recomeça junto (14/11/2026, pedido do usuário): no próximo golpe abre outra janela
+	unit.FirstStrikeAt = nil
+	for _, effect in effects(unit, "Shield") do
+		unit.Shield = math.max(unit.Shield, (effect.Percent or 0) * unit.MaxHp)
+		ctx.emit(unit, unit.PassiveName)
+	end
+	local initiative = effects(unit, "Initiative")[1]
+	if initiative then
+		unit.InitiativeHits = initiative.Turns or 1
+		unit.Cooldown = 0
+		ctx.emit(unit, unit.PassiveName)
+	end
+	for _, effect in effects(unit, "TeamShield") do
+		for _, ally in allies do
+			if not ally.Ko then
+				local amount = (effect.Percent or 0) * (if effect.OwnMaxHp then ally.MaxHp else unit.MaxHp)
+				ally.Shield = math.max(ally.Shield, amount)
+			end
+		end
+		ctx.emit(unit, unit.PassiveName, "Shield")
+	end
+	-- Golpe de abertura (NUKE do Bombardiro): só com alvo de evento (Patapim, piñata); sem evento não tem em quem
+	-- (13/11/2026: soltava a NUKE no chão sozinho com o Coliseu vazio)
+	if ctx.bagGround() then
+		for _, effect in effects(unit, "OpeningStrike") do
+			ctx.emit(unit, unit.PassiveName, effect.Fx, nil, ctx.bagGround())
+			ctx.hitBag(unit, effect.Multiplier or 1)
+		end
+		-- Napalm do Bombombini (15/11/2026): na briga o único alvo é o de evento
+		for _, effect in effects(unit, "OpeningSnipe") do
+			ctx.emit(unit, unit.PassiveName, effect.Fx, nil, ctx.bagGround())
+			ctx.hitBag(unit, effect.Multiplier or 1)
+		end
+	end
+end
+
+-- Queimadura e cura por turno, no ritmo de TurnSeconds; habilidades de início a cada RestartSeconds
+function BrawlSkills.tick(ctx: any, unit: any, dt: number, now: number)
+	if unit.Ko then
+		return
+	end
+	-- Só durante um evento com alvo (Patapim, piñata): parado no Coliseu sem evento, nada se repete (13/11/2026)
+	if ctx.bagGround() then
+		unit.RestartTimer = (unit.RestartTimer or 0) + dt
+		if unit.RestartTimer >= SKILLS.RestartSeconds then
+			unit.RestartTimer -= SKILLS.RestartSeconds
+			startSkills(ctx, unit, ctx.allies(unit))
+		end
+	else
+		unit.RestartTimer = 0
+	end
+	if unit.BurnUntil > now then
+		unit.BurnTimer += dt
+		if unit.BurnTimer >= SKILLS.TurnSeconds then
+			unit.BurnTimer -= SKILLS.TurnSeconds
+			damage(ctx, unit.BurnSource, unit, unit.BurnPercent * unit.MaxHp)
+		end
+	end
+	local healing = effects(unit, "HealPerTurn")
+	if #healing > 0 and not unit.Ko then
+		unit.HealTimer += dt
+		if unit.HealTimer >= SKILLS.TurnSeconds then
+			unit.HealTimer -= SKILLS.TurnSeconds
+			for _, effect in healing do
+				heal(ctx, unit, (effect.Percent or 0) * unit.MaxHp)
+			end
+		end
+	end
+	-- A cada turno: cura o aliado com a menor fração de Vida, nunca ele mesmo (Giraffa Celeste, 17/11/2026)
+	local allyHealing = effects(unit, "TurnHealAlly")
+	if #allyHealing > 0 and not unit.Ko then
+		unit.AllyHealTimer = (unit.AllyHealTimer or 0) + dt
+		if unit.AllyHealTimer >= SKILLS.TurnSeconds then
+			unit.AllyHealTimer -= SKILLS.TurnSeconds
+			local worst = nil
+			for _, ally in ctx.allies(unit) do
+				if
+					ally ~= unit
+					and not ally.Ko
+					and ally.Hp < ally.MaxHp
+					and (not worst or ally.Hp / ally.MaxHp < worst.Hp / worst.MaxHp)
+				then
+					worst = ally
+				end
+			end
+			if worst then
+				for _, effect in allyHealing do
+					heal(ctx, worst, (effect.Percent or 0) * unit.MaxHp)
+				end
+				ctx.emit(unit, unit.PassiveName, "Heal")
+			end
+		end
+	end
+end
+
+-- Chegou ao Coliseu (ou entrou no time lá dentro): as habilidades de início, mas só se já passaram RestartSeconds
+-- desde a última vez desse brainrot; senão o relógio continua de onde estava (tirar e pôr não recomeça nada)
+function BrawlSkills.onArrive(ctx: any, list: { any })
+	local now = os.clock()
+	for _, unit in list do
+		if not unit.Ko then
+			local byId = lastStart[unit.Owner]
+			local last = byId and byId[unit.BrainrotId]
+			if last and now - last < SKILLS.RestartSeconds then
+				unit.RestartTimer = now - last
+			else
+				unit.RestartTimer = 0
+				startSkills(ctx, unit, list)
+			end
+		end
+	end
+end
+
+-- Saiu do servidor: esquece as horas dele
+function BrawlSkills.forget(owner: any)
+	lastStart[owner] = nil
+end
+
+return BrawlSkills
+]=]
 SOURCES["src/shared/Brainrot/BattleDamage.luau"] = [=[
 --[[
 	BattleDamage — quanto dano cada lutador causou, recebeu e quanta Vida curou numa luta, contado pelo roteiro do
@@ -4018,7 +5203,7 @@ ArtifactConfig.EmptyScribbleColor = Color3.fromRGB(15, 16, 15)
 ArtifactConfig.MaxHpHitColor = Color3.fromRGB(196, 96, 255)
 -- Jakalopita contra o Chefão do rodízio (TowerBossConfig; 15/11/2026, pedido do usuário): só esta fração do dano extra
 -- (TowerService põe MaxHpHitShare no chefe). Os chefes da Torre levam o dano inteiro
-ArtifactConfig.MaxHpHitBossShare = 0.5
+ArtifactConfig.MaxHpHitBossShare = 0.4 -- 20/11/2026 (pedido do usuário): 60% menos; era 0.5
 -- Jakalopita na Piñata (16/11/2026, pedido do usuário): Percent × isto do dano de cada golpe, à parte (2% → +10%)
 ArtifactConfig.MaxHpHitPinataMultiplier = 5
 -- Cor do número do dano extra do Julgamento de Eyros (FirstStrike; 14/11/2026, pedido do usuário: amarelo)
@@ -4254,7 +5439,7 @@ local STAT_ARTIFACTS = {
 		Steps = MAX_HP_HIT_STEPS,
 		-- 14/11/2026 (pedido do usuário): deixar claro que vale em ataques E habilidades
 		Text = "da Vida máxima do alvo de dano extra a cada golpe, em ataques e habilidades",
-		Note = "Tem 50% de eficácia contra Super chefes.",
+		Note = "Tem 40% de eficácia contra super chefões.",
 	},
 	{
 		Base = "Judgment",
@@ -4474,6 +5659,195 @@ function ArtifactConfig.equipRandom(brainrot: any, rarityId: string, count: numb
 end
 
 return ArtifactConfig
+]=]
+SOURCES["src/shared/Config/BattleFxConfig.luau"] = [=[
+--[[
+	BattleFxConfig — cores, tempos e tamanhos dos efeitos visuais da luta e da briga.
+	Tempos em segundos na velocidade 1x (o BattleController divide no 2x).
+]]
+
+local BattleFxConfig = {
+	-- "+N Aura" de quem caiu e "NÍVEL N!" de quem subiu no meio da luta (15/11/2026, pedido do usuário): sobe devagar
+	-- e reto, por cima de todos os números. Width = largura em studs (maior que os números de dano), Above = studs acima
+	-- da cabeça, Rise = quanto sobe em Seconds, Fade = segundos do fim em que some
+	-- FeetAbove = studs acima do pé (o "+N Aura" sai no pé de quem caiu; 16/11/2026, pedido do usuário)
+	-- Aura = o "+N Aura" dura × Aura do tempo (sobe e some 40% mais rápido; 16/11/2026, pedido do usuário)
+	RisePopup = {
+		Width = 10,
+		Above = 1.5,
+		FeetAbove = 0.5,
+		Rise = 2.5,
+		Seconds = 2,
+		Fade = 0.5,
+		Aura = 0.6,
+		Stagger = 2.5,
+	},
+	-- Texto das habilidades (16/11/2026, pedido do usuário: "🌳 RAÍZES!" e outros estavam enormes): todos do tamanho do
+	-- "🍎 Maçã Dourada" de cada tela; só o 3º TUNG do Tung fica grande. Height = altura em studs do texto, Pixels =
+	-- mínimo em pixels de longe (Arena). BattleFx.bigText usa o do visual (skillTextHeight/skillTextPixels)
+	SkillText = {
+		Battle = { Height = 1.3 }, -- Torre/PvP: o mesmo dos números e do nome da passiva (popup 5 x 1,3)
+		Arena = { Height = 0.754, Pixels = 24 }, -- Arena (evento): popup 2,9 x 0,754 com mínimo de 24 px
+		Brawl = { Height = 1.35 }, -- briga do Coliseu: skillText 4,5 x 1,35 (o da maçã)
+	},
+	-- Pulo na Cabeça do Chimpanzini (13/11/2026, pedido do usuário): sem animação, só a posição: Hops pulos em Seconds,
+	-- cada um em arco de HopHeight studs, caindo em cima da cabeça do alvo (o dano sai em cada aterrissagem).
+	-- BrawlLift = altura da cabeça do alvo de evento na briga (Patapim, piñata), que não tem modelo de brainrot
+	-- Animation (13/11/2026, modelo do Chimpanzini do usuário): o começo do pulo, tocado a cada pulo (do chão e da cabeça
+	-- do alvo) e solto quando ele volta para o lugar; modelo sem ela só pula
+	HeadJump = { Hops = 3, Seconds = 1, HopHeight = 2.5, ReturnTime = 0.25, BrawlLift = 6, Animation = "power" },
+	-- Explosão do golpe final do Tung (07/11/2026, sprite sheet do usuário: assets/fx/Explosion.png, 8 quadros de 70 px
+	-- numa fileira). Duration = o total; Size em studs (luta / briga).
+	Explosion = {
+		Image = "rbxassetid://111103520057697",
+		Frames = 8,
+		FrameSize = 70,
+		Duration = 0.4, -- 07/11/2026: era 0.6 (pedido do usuário)
+		-- Quadros que a explosão começa antes da pancada (era 2, para o clarão do 3º quadro cair na hora dela; 08/11/2026:
+		-- 0, o usuário via a explosão um pouco antes do dano e da paulada)
+		LeadFrames = 0,
+		GroundLift = 1, -- studs acima do chão embaixo do alvo (08/11/2026, pedido do usuário)
+		Size = 12,
+		BrawlSize = 10,
+		BombSize = 14, -- bomba do Bombardiro (luta e briga)
+	},
+	Textures = {
+		Sparkle = "rbxasset://textures/particles/sparkles_main.dds",
+		Fire = "rbxasset://textures/particles/fire_main.dds",
+		Smoke = "rbxasset://textures/particles/smoke_main.dds",
+	},
+	Ring = { Start = 1, End = 9, Time = 0.35, Thickness = 0.2 },
+	-- Onda de choque do golpe final do Tung (13/11/2026, pedido do usuário: no lugar da explosão; BattleFx.shockwave):
+	-- clarão no chão, 2 anéis abrindo, parede de poeira correndo para fora e pedrinhas voando
+	Shockwave = {
+		Reach = 11, -- raio (studs) que a onda alcança na luta
+		BrawlReach = 9, -- na briga e na Arena
+		FlashTime = 0.16,
+		RingTime = 0.45,
+		RingGap = 0.09, -- o 2º anel sai depois disto
+		RingThickness = 0.14,
+		Segments = 18, -- placas da parede de poeira
+		WallHeight = 2.4,
+		WallTime = 0.55,
+		DustColor = Color3.fromRGB(214, 190, 150),
+		Rocks = 9,
+		RockColor = Color3.fromRGB(125, 98, 72),
+		RockTime = 0.5,
+		RockHeight = 2.5,
+	},
+	CameraShake = { Amplitude = 0.35, Step = 0.03 },
+	TimeStop = {
+		Shout = "ZA WARUDO!",
+		-- Animação do modelo do Lirilì (14/11/2026, arquivo do usuário): tocada por cima do idle no grito; o relógio
+		-- ataca de 0,55 a 1 s, junto com os 4 golpes (0,5 s + 4 × 0,25). Quem não tem a animação fica igual
+		Animation = "za_warudo",
+		SphereSize = 70,
+		SphereTime = 0.45,
+		GrayTime = 0.25,
+		Saturation = -1,
+		Contrast = 0.25,
+		Tint = Color3.fromRGB(225, 255, 225),
+		ResumeTime = 0.2,
+		KnifeFlyTime = 0.12,
+		PopupStagger = 0.05,
+	},
+	Freeze = { Color = Color3.fromRGB(150, 220, 255), Transparency = 0.4, Shards = 8 },
+	Bombs = { PlaneHeight = 12, PlaneTime = 0.4, DropTime = 0.25 },
+	-- Pneu da Boneca Ambalabu (Fx "TireRoll"): vira pneu ("power_in", que para no último quadro), rola por
+	-- cima de todos os inimigos girando o osso "Tire" e volta rolando. SpinSign inverte o giro se rolar ao contrário.
+	TireRoll = {
+		Animation = "power_in",
+		Bone = "Tire",
+		RadiusStuds = 1.02, -- raio do pneu em studs com o modelo no tamanho normal (8 unidades × 0.128)
+		SpinSign = -1,
+		TransformTime = 0.45,
+		TravelTime = 0.75,
+		PastTarget = 3, -- studs depois do último inimigo
+		ReturnTime = 0.6,
+		Text = "🛞 ATROPELOU!",
+		Color = Color3.fromRGB(70, 70, 80),
+		BrawlTime = 1.2, -- na briga: quanto tempo fica de pneu girando
+	},
+	Bonk = { HitTime = 0.18, RingGrow = 1.4 },
+	Execute = { Text = "EXECUÇÃO!", Color = Color3.fromRGB(255, 60, 60), DarkTime = 0.2 },
+	Colors = {
+		Ink = Color3.fromRGB(120, 60, 200),
+		Zap = Color3.fromRGB(255, 240, 80),
+		Thorns = Color3.fromRGB(90, 200, 90),
+		Fire = Color3.fromRGB(255, 120, 40),
+		Gold = Color3.fromRGB(255, 210, 80),
+		Wave = Color3.fromRGB(70, 160, 255),
+		Banana = Color3.fromRGB(255, 225, 60),
+		Rose = Color3.fromRGB(255, 150, 200),
+	},
+	-- Efeito de cada habilidade: Color, Text (some se nil) e Shots (projéteis do dono até o alvo)
+	Presets = {
+		Zap = { Color = Color3.fromRGB(255, 240, 80), Text = "⚡ ZAP!", Shots = 2 },
+		Gallop = { Color = Color3.fromRGB(235, 235, 235), Text = "🦓 GALOPE!" },
+		Shell = { Color = Color3.fromRGB(170, 120, 70) },
+		CocoShell = { Color = Color3.fromRGB(170, 120, 70) }, -- Casca de Coco nova do Burbaloni (19/11/2026), a mesma cor
+		Bite = { Color = Color3.fromRGB(250, 245, 225), Text = "🦷 NHAC!" },
+		Dash = { Color = Color3.fromRGB(90, 190, 255), Text = "⚡ ARRANCADA!" },
+		Glitch = { Color = Color3.fromRGB(80, 255, 220), Text = "📵 SEM SINAL!" },
+		Ice = { Color = Color3.fromRGB(170, 230, 255), Text = "🧊 GELOU!", Shots = 4 },
+		Pierce = { Color = Color3.fromRGB(255, 225, 90), Text = "✏️ NA PONTA!", Shots = 1 },
+		Whistle = { Color = Color3.fromRGB(255, 225, 70), Text = "PRIIII!" },
+		Coffee = { Color = Color3.fromRGB(120, 72, 40), Text = "☕ DOPPIO!" },
+		Block = { Color = Color3.fromRGB(220, 60, 60), Text = "🛡️ BLOQUEOU!" },
+		Scan = { Color = Color3.fromRGB(255, 50, 50), Text = "🎯 ALVO!" },
+		Stink = { Color = Color3.fromRGB(130, 190, 60), Text = "🤢 CHULÉ!", Shots = 3 },
+		SweetSalty = { Color = Color3.fromRGB(255, 190, 215) },
+		Splash = { Color = Color3.fromRGB(80, 180, 255), Text = "🐬 SPLASH!" },
+		Float = { Color = Color3.fromRGB(190, 210, 255), Text = "🌌 FLUTUOU!" },
+		Coconut = { Color = Color3.fromRGB(245, 245, 235) },
+		Fire = { Color = Color3.fromRGB(255, 120, 40), Text = "🔥 QUEIMOU!", Shots = 2 },
+		Gunshot = { Color = Color3.fromRGB(255, 225, 90), Text = "RATATÁ!", Shots = 5 },
+		Gravity = { Color = Color3.fromRGB(190, 150, 255), Text = "🪐 GRAVIDADE!" },
+		Dive = { Color = Color3.fromRGB(255, 255, 255), Text = "✈️ RASANTE!" },
+		Rage = { Color = Color3.fromRGB(255, 70, 50), Text = "💪 FÚRIA!" },
+		Chomp = { Color = Color3.fromRGB(110, 230, 110), Text = "🍉 NHAC!" },
+		Swim = { Color = Color3.fromRGB(190, 225, 255), Text = "🐟 ESCAPOU!" },
+		FishHeal = { Color = Color3.fromRGB(110, 240, 160), Text = "🐟 CUROU!" }, -- Trulimero (14/11/2026)
+		StarHeal = { Color = Color3.fromRGB(150, 230, 255), Text = "🌌 CUROU!" }, -- Giraffa Celeste (17/11/2026)
+		Roots = { Color = Color3.fromRGB(125, 85, 45), Text = "🌳 RAÍZES!" },
+		Phoenix = { Color = Color3.fromRGB(255, 200, 70), Text = "✨ SETE VIDAS!" },
+		Pirouette = { Color = Color3.fromRGB(255, 150, 200), Text = "🩰 PIRUETA!" },
+		Banana = { Color = Color3.fromRGB(255, 225, 60), Text = "🍌 ESCORREGOU!" },
+		ShieldPop = { Color = Color3.fromRGB(255, 210, 80), Text = "💥 ESTOUROU!" },
+		TireBlast = { Color = Color3.fromRGB(255, 120, 40), Text = "💥 PNEU!" },
+		-- Bobrito (15/11/2026): uma bala por golpe da rajada (a luta por turnos desenha à parte, BattleController)
+		Burst = { Color = Color3.fromRGB(255, 225, 90), Text = "RATATÁ!", Shots = 1 },
+		-- Bombombini (15/11/2026): napalm no inimigo com menos Vida (luta por turnos: BattleController napalmRun)
+		Napalm = { Color = Color3.fromRGB(255, 110, 30), Text = "🔥 NAPALM!" },
+	},
+	-- Rajada do Bobrito na luta por turnos: tiros do lugar dele (sem andar), uma bala por golpe
+	Burst = { Color = Color3.fromRGB(255, 225, 90), Text = "RATATÁ!", BulletSize = 0.35 },
+	-- Napalm do Bombombini: voa até ficar em cima do alvo, solta a bomba (bola laranja) e volta; fogo no chão depois
+	Napalm = {
+		Color = Color3.fromRGB(255, 110, 30),
+		Text = "🔥 NAPALM!",
+		FlyHeight = 7,
+		FlyTime = 0.5,
+		DropHeight = 6,
+		DropTime = 0.3,
+		BombSize = 1.1,
+		FireTime = 0.8, -- quanto tempo o fogo fica no chão embaixo do alvo
+	},
+	Shot = { Size = 0.6, Time = 0.22, Stagger = 0.04 },
+	-- Briga no Coliseu (Parte D)
+	Brawl = { RingEnd = 6, RingTime = 0.3, TextTime = 0.7, MaxPerSecond = 6 },
+	-- Linha do tempo da luta: espécies cujo retrato mira no osso "head" do modelo (Viewport HeadBone) em vez de 78% da
+	-- altura (14/11/2026, pedido do usuário: o relógio do Lirilì fica bem acima e a cabeça não aparecia)
+	-- GlorboFruttodrillo também (14/11/2026: crocodilo comprido, a cabeça fica baixa e na frente)
+	TimelineHeadBone = { LiriliLarila = true, GlorboFruttodrillo = true } :: { [string]: boolean },
+	-- Som no golpe da habilidade (16/11/2026, pedido do usuário): espécie → som tocado quando o golpe COM a passiva
+	-- acerta (Glorbo: a mordida que agarra). Só na tela da luta (Torre, Chefão, Duelo)
+	PassiveHitSounds = {
+		GlorboFruttodrillo = { Id = "rbxassetid://115878657073501", Volume = 0.45 }, -- era 0.9 (20/11/2026, -50%)
+	} :: { [string]: { Id: string, Volume: number } },
+}
+
+return BattleFxConfig
 ]=]
 SOURCES["src/shared/Config/BlockAnimConfig.luau"] = [=[
 --[[
@@ -4969,6 +6343,614 @@ function CombatConfig.attackInterval(speed: number): number
 end
 
 return CombatConfig
+]=]
+SOURCES["src/shared/Config/EventConfig.luau"] = [=[
+--[[
+	EventConfig — os eventos do Coliseu (etapa 9; design em docs/design-etapa-9-arena.md, parte A).
+
+	"Entrou, já está jogando": sem inscrição nem fila. Participa quem está DENTRO do Coliseu.
+	Agenda GLOBAL desde 10/11/2026 (pedido do usuário; Shared/Events/EventSchedule): ciclo de 12 min (era 20 até 12/11/2026), igual em todos os
+	servidores; Coliseu no minuto 3, evento da ilha no minuto 9, a Máquina de Vendas troca nos minutos 0 e 6. O
+	evento de cada ciclo sai do peso em Rotation/IslandRotation, nunca um dos 2 anteriores da mesma lista.
+
+	Prêmios em "segundos de R": R = renda da vitrine por segundo + JunkIncomeEstimate × multiplicador da
+	Trituradora. Assim o prêmio vale o mesmo no minuto 10 e na hora 20 (passa pelo multiplicador de moedas).
+]]
+
+local EventConfig = {
+	-- Agenda global (Shared/Events/EventSchedule). Epoch = 10/11/2026 00:00 UTC (múltiplo do ciclo e das rodadas de
+	-- 6 min da Máquina de Vendas, para os minutos 0 e 6 do ciclo serem as trocas dela)
+	Schedule = {
+		Epoch = 1794268800,
+		-- Uma coisa a cada 3 min (12/11/2026, pedido do usuário; era de 5 em 5): ciclo de 12 min, loja/ovos do campo nos
+		-- minutos 0 e 6 (ShopConfig.RotationSeconds), Coliseu no 3, ilha no 9
+		Cycle = 12 * 60,
+		ColiseumAt = 3 * 60, -- começo do evento do Coliseu, contado do começo do ciclo
+		IslandAt = 9 * 60, -- começo do evento da ilha (Bombardiro: a hora em que ele aparece no céu)
+		NoRepeat = 2, -- o evento não pode ser nenhum destes últimos da mesma lista
+		Seed = 20261110,
+	},
+	-- Peso de cada evento do Coliseu no sorteio do ciclo (o Ovo Cósmico sai o dobro)
+	Rotation = { CosmicEgg = 2, Pinata = 1, KingOfTheRing = 1, PatapimBoss = 1, Ufo = 1, ArenaBattle = 1 },
+	-- Eventos da ilha (fora do Coliseu): "Airdrop" = Bombardiro (AirdropService); os outros rodam pelo EventService
+	-- (14/11/2026: entrou a Caça aos Ovos; 15/11/2026: o Balão)
+	IslandRotation = { Airdrop = 1, GoldenFrigo = 1, EggHunt = 1, Balloon = 1, Volcano = 1 },
+
+	AnnounceBefore = 60, -- faixa no topo de todas as telas
+	ToastBefore = 30, -- aviso para quem está fora do Coliseu
+	CountdownBefore = 10, -- contagem 10…1 e param de cair tralhas
+	-- Eventos da ilha (Bombardiro, Frigo Dourado; 12/11/2026, pedido do usuário): faltando tanto para começar, os
+	-- brainrots que seguem os jogadores somem para todo mundo e só voltam quando o evento acaba. Atributo
+	-- "IslandTeamsHidden" no Workspace (AirdropService/EventService) → Client/FollowController
+	IslandHideTeamsBefore = 10,
+	CountdownRadius = 150, -- contagem grande na tela de quem está até aqui do centro (13/11/2026: era 120; Coliseu 50% maior)
+	ResultsTime = 8, -- quanto tempo o telão mostra o vencedor
+
+	-- R = vitrine + isto (renda das tralhas estimada, moedas por segundo)
+	JunkIncomeEstimate = 13,
+	-- Quem "participou" (ganha a consolação): tempo dentro do Coliseu e passos dados durante o evento
+	Participation = { MinSeconds = 30, MinStuds = 30 },
+	Tick = 0.1,
+
+	Events = {
+		-- Arena (08/11/2026, pedido do usuário; Server/Events/ArenaBattle): 4 jogadores, 3 brainrots cada, cada um por si.
+		-- Fases, tempos e regras da luta em Config/ArenaBattleConfig
+		ArenaBattle = {
+			Name = "Arena",
+			Title = "ARENA",
+			Icon = "⚔️",
+			Goal = "Entre num círculo verde e lute!\nQuanto melhor o lugar, mais 💎 e moedas!",
+			Brawl = false,
+			-- 14/11/2026 (pedido do usuário): o time de quem não está lutando some dentro do Coliseu (a briga não desenha;
+			-- o FollowController esconde até a porta, arenaEventHides). Os lutadores são desenhados pelo ArenaBattleController
+			HideTeams = true,
+			KeepWhenDrawn = true,
+		},
+		Pinata = {
+			Name = "Piñata Absurda",
+			Title = "PIÑATA ABSURDA",
+			Icon = "🪅",
+			Goal = "Seus brainrots batem na piñata!\nA cada 20K de dano: 💎 e moedas!", -- 14/11/2026: mais direto
+			Brawl = false,
+			Duration = 45, -- 16/11/2026 (pedido do usuário): era 75
+			-- um marco a cada tanto de dano do servidor (soma do dano de cada golpe, 80% a 100% do Ataque); 12/11/2026
+			-- (pedido do usuário): era 76.500
+			GoalDamage = 20000,
+			VaultShare = 0.5, -- do total do Cofre, a cada GoalDamage do PRÓPRIO jogador, pago no fim (13/11/2026: era 75%; antes 15%)
+			DamageReduction = 0.3, -- 16/11/2026 (pedido do usuário): 30% a menos em todo golpe; Chamas de Goes furam
+			DiamondsPerGoal = 50, -- e mais estes diamantes por marco (12/11/2026, pedido do usuário)
+			HitRange = 7,
+			BobSpeed = 6,
+			BobHeight = 0.6,
+			HudEvery = 0.25,
+		},
+		-- Invasão OVNI (06/11/2026, pedido do usuário; Server/Events/Ufo): nave zanzando e raio que dá talento e diamantes
+		Ufo = {
+			Name = "Invasão OVNI",
+			Title = "INVASÃO OVNI",
+			Icon = "🛸",
+			Goal = "Aumenta talentos e recupera os diamantes dos brainrots equipados!", -- texto do usuário (14/11/2026)
+			Brawl = false,
+			-- MinPlayers saiu em 07/11/2026 (pedido do usuário): todo evento acontece com qualquer número de jogadores
+			KeepWhenDrawn = true, -- sorteado, acontece mesmo se sair gente depois (pedido do usuário)
+			Duration = 75,
+			-- Segunda nave (13/11/2026, pedido do usuário): com ExtraShipPlayers ou mais jogadores no servidor quando começa
+			ExtraShipPlayers = 5, -- (velho: desde 14/11/2026 vale o ShipsByPlayers)
+			-- 14/11/2026 (pedido do usuário): naves pelo número de jogadores no SERVIDOR (do maior para o menor): 3 a partir de
+			-- 7, 2 a partir de 3, senão 1. Entrou gente no meio do evento: nascem as que faltam (nunca some nenhuma)
+			ShipsByPlayers = { { Players = 7, Ships = 3 }, { Players = 3, Ships = 2 } },
+			MaxShips = 3,
+			Height = 19, -- altura da nave acima do piso (06/11/2026: +20%; o raio cresce junto)
+			Speed = 24.75, -- studs/s zanzando (06/11/2026: era 9; 13/11/2026: era 11, × 1,5 com o Coliseu; 14/11/2026: +50%, era 16,5)
+			MaxDistance = 37.5, -- até onde ela vai, do centro do Coliseu (06/11/2026: era 18; 13/11/2026: era 25; o Coliseu tem 45)
+			WanderTime = { 2, 2 }, -- segundos zanzando antes de parar (14/11/2026, pedido do usuário: 2 s; era 3 a 6)
+			BeamTime = 5, -- segundos com o raio ligado
+			BeamRadius = 5, -- raio do desenho do feixe
+			BeamHitScale = 1.2, -- raio de quem ganha = BeamRadius × isto (10/11/2026: +20% só na hitbox, o visual fica igual)
+			TalentPerSecond = 2, -- por segundo, num talento ATUAL sorteado de cada um dos 3 do time (até o teto)
+			DiamondsPerSecond = 0.07, -- do DiamondMax de cada um dos 3 do time (06/11/2026: era 5%; 10/11/2026: 10% → 7%)
+			HudEvery = 0.25,
+		},
+		PatapimBoss = {
+			Name = "Brr Brr Patapim",
+			Title = "CHEFÃO: BRR BRR PATAPIM",
+			Icon = "🌳",
+			Goal = "Derrote o chefão e ganhe o Ovo da Natureza!\nFuja das marcas vermelhas!",
+			Brawl = false,
+			-- MinPlayers saiu em 07/11/2026 (pedido do usuário): todo evento acontece com qualquer número de jogadores
+			Duration = 90,
+			Species = "BrrBrrPatapim",
+			Scale = 2.5,
+			HitRange = 8,
+			ArenaRadius = 36, -- onde os círculos aleatórios caem (13/11/2026: era 24; Coliseu 50% maior)
+			PlayerDamage = 40, -- Vida tirada do jogador em cada ataque (fixo; o jogador tem 100 + a árvore de skills)
+			HitFraction = 0.002, -- cada ataque de brainrot tira esta fração da Vida dele (0,2%; pedido do usuário)
+			-- Dano "artificial" (itens: Jakalopita, Julgamento de Eyros) tira esta fração a cada vez que sai (0,05%; 14/11/2026,
+			-- pedido do usuário; antes os itens não davam nada nele)
+			ArtificialFraction = 0.0005,
+			EggShare = 0.1, -- fração da Vida dele que o jogador precisa ter tirado para ganhar o ovo (10%; era 5%, 16/11/2026)
+			Egg = "NatureEgg",
+			-- Se ele morrer, quem ganhou o ovo leva também VaultShare do limite do Cofre em moedas (12/11/2026, pedido do
+			-- usuário; passa pelo multiplicador, como a Piñata)
+			VaultShare = 1.5,
+			-- segundos de espera depois de um ataque terminar (05/11/2026: -1 s; 07/11/2026: -0,75 s, pedidos do usuário)
+			AttackGap = { 0.25, 1.75 },
+			RepeatChance = 0.25, -- chance de repetir o mesmo ataque
+			-- Telegraph 0,5 s mais rápido nos dois ataques (07/11/2026, pedido do usuário: 1.2 → 0.7 e 1.5 → 1)
+			-- 13/11/2026 (pedido do usuário): +1 linha reta a cada PlayersPerExtraLine jogadores batendo nele (brainrots que
+			-- acertaram nos últimos HitterWindow s), até MaxLines de uma vez; linhas a pelo menos MinLineAngle graus uma da outra
+			-- 14/11/2026 (pedido do usuário): SEMPRE Lines linhas (3), a pelo menos MinLineAngle graus (15) uma da outra,
+			-- cada uma mirando um jogador diferente (o mais perto primeiro); faltando jogador, espalhadas em volta. Sem
+			-- Lines, volta a regra de 13/11 (1 + 1 a cada PlayersPerExtraLine batendo nele, até MaxLines)
+			Slam = {
+				Telegraph = 0.7,
+				Length = 45, -- 13/11/2026 (pedido do usuário): +50% de alcance (era 30)
+				Width = 15, -- 13/11/2026 (pedido do usuário): +25% de largura (era 12)
+				Travel = 0.45,
+				WaveHeight = 6,
+				Lines = 3,
+				PlayersPerExtraLine = 3,
+				MaxLines = 3,
+				HitterWindow = 5,
+				MinLineAngle = 15, -- era 40
+			},
+			-- Telegraph: tempo até o círculo vermelho encher e as raízes saírem (05/11/2026: 2 → 1.5, pedido do usuário).
+			-- StompAt: segundo da animação "summon" em que ele pisa; ela toca mais rápido para pisar na hora certa.
+			-- RandomCircles: círculos sorteados, fora o de cada jogador (14/11/2026, pedido do usuário: era 5)
+			Roots = { Telegraph = 1, StompAt = 2, RandomCircles = 7, Radius = 6, RootSeconds = 3 },
+			-- Floresta (14/11/2026, pedido do usuário): o chão INTEIRO fica marcado de vermelho, enchendo do centro até a
+			-- borda em Telegraph (50% mais que as Roots), menos SafeZones círculos verdes (efeito de área, como o do Cofre) de
+			-- SafeRadius; cheio, espinhos sobem no chão todo e prendem (RootSeconds das Roots) e machucam quem ficou fora
+			-- dos verdes. FloorRadius = até onde vai (o apótema do Coliseu); os verdes nascem a até SafeSpread do centro,
+			-- a pelo menos SafeGap um do outro; SpikeSpacing = distância entre os espinhos do desenho
+			Forest = {
+				Telegraph = 1.62, -- 14/11/2026 (pedido do usuário): -10% (era 1,8; antes 1,5)
+				-- Espinhos ficam SpikeSeconds no chão e prendem esse mesmo tempo (14/11/2026, pedido do usuário: 1,25 → 1 s)
+				SpikeSeconds = 1,
+				-- Enquanto carrega, a borda do Coliseu (o LED, MapConfig.Octagon.Apothem) vira parede: ninguém entra nem sai
+				WallHeight = 40,
+				WallThickness = 2,
+				StompAt = 2,
+				SafeZones = 2,
+				SafeRadius = 7,
+				SafeSpread = 30,
+				SafeGap = 18,
+				FloorRadius = 45,
+				SpikeSpacing = 5,
+			},
+			HudEvery = 0.25,
+		},
+		-- Rei da Colina (refeito em 05/11/2026, pedido do usuário): um círculo no piso fica parado HoldTime s e pula
+		-- bruscamente (MoveTime s) para outro lugar, por Duration s. Ganha quem ficou mais tempo dentro dele.
+		-- 1º: diamantes de DiamondsMin a DiamondsMax (pelo nível do maior brainrot, 1 a 200) + VaultShare do limite
+		-- do Cofre em moedas; 2º: SecondShare disso; os outros nada.
+		KingOfTheRing = {
+			Name = "Rei da Colina",
+			Title = "REI DA COLINA",
+			Icon = "👑",
+			Goal = "Fique no círculo o maior tempo!\nGanha muitos 💎 e moedas!",
+			Brawl = false,
+			-- MinPlayers saiu em 07/11/2026 (pedido do usuário): todo evento acontece com qualquer número de jogadores
+			Duration = 60,
+			Radius = 9, -- raio do círculo (studs; 13/11/2026: era 6, +50% a pedido do usuário)
+			-- Quantos círculos ao mesmo tempo (13/11/2026, pedido do usuário); os destinos nunca se sobrepõem: centros a
+			-- pelo menos 2 × Radius + CircleGap
+			Circles = 2,
+			CircleGap = 1,
+			-- Visual: cilindro que some em degradê subindo (placas com SurfaceGui + UIGradient)
+			WallHeight = 6,
+			WallSides = 24,
+			WallBottomTransparency = 0.45,
+			DiscTop = 0.06, -- o topo do disco fica tanto acima do piso, e ele afunda o resto (nada no mesmo plano do chão)
+			HoldTime = 2, -- parado
+			MoveTime = 0.35, -- pulando para o próximo lugar
+			-- 13/11/2026: × 1,5 com o Coliseu (eram 19 e 12)
+			MaxDistance = 28.5, -- o centro do círculo fica até aqui do centro do Coliseu
+			MinJump = 18, -- distância mínima de um lugar para o próximo
+			-- 12/11/2026 (pedido do usuário): 100–500 💎 e 150% do Cofre (eram 50–200 e 50%)
+			-- 13/11/2026 (pedido do usuário): máximo 400 💎 e 200% do Cofre
+			-- 14/11/2026 (pedido do usuário): o dobro (eram 100–400 💎 e 200% do Cofre)
+			DiamondsMin = 200,
+			DiamondsMax = 800,
+			VaultShare = 4,
+			SecondShare = 0.5,
+			HudEvery = 0.25,
+			-- Quem está dentro do círculo: contorno amarelo + tinta leve, como no raio do OVNI (09/11/2026, pedido do usuário)
+			GlowColor = Color3.fromRGB(255, 215, 60),
+			GlowFillTransparency = 0.7,
+			GlowOutlineTransparency = 0.15,
+		},
+		-- Frigo Dourado (nome provisório; Server/Events/GoldenFrigo; 08/11/2026, pedido do usuário). Evento da ilha
+		-- (IslandRotation) desde 10/11/2026
+		GoldenFrigo = {
+			Name = "Frigo Dourado",
+			Title = "FRIGO DOURADO",
+			Icon = "🐫",
+			Goal = "Encoste no Frigo Dourado primeiro!\nGanha 💎 e moedas!",
+			Brawl = false,
+			Outside = true, -- acontece fora do Coliseu
+			-- 18/11/2026 (pedido do usuário): do IslandHideTeamsBefore até o fim, os times seguem em tamanho 0% (sem o
+			-- Tamanho do brainrot), na formação normal; Workspace "IslandTeamsZeroSize" → Client/FollowController
+			TeamsZeroSize = true,
+			-- Passos (17/11/2026, pedido do usuário): um dos dois sorteado a cada StepEvery s enquanto ele anda
+			StepEvery = 0.4, -- (era 0,25; volume 1 → 0,6 em 17/11/2026)
+			StepSounds = {
+				{ Id = "rbxassetid://135037154891351", Volume = 0.6, MinDistance = 30, MaxDistance = 240 },
+				{ Id = "rbxassetid://110522236020035", Volume = 0.6, MinDistance = 30, MaxDistance = 240 },
+			},
+			-- Prêmio de quem encostar (12/11/2026, no molde do Bombardiro e do Rei da Colina): diamantes de DiamondsMin a
+			-- DiamondsMax pelo nível do brainrot mais alto + VaultShare do limite do Cofre em moedas (é dourado: moedas)
+			-- 13/11/2026 (pedido do usuário): 250–700 💎 (era 150–1.500)
+			DiamondsMin = 250,
+			DiamondsMax = 700,
+			VaultShare = 1,
+			-- Perseguição (12/11/2026, pedido do usuário): cada segundo a até ChaseRange studs do Frigo vale ChasePerSecond
+			-- (8%; 13/11/2026, pedido do usuário: era 6%, antes 2,5% e 1%) do prêmio de quem pega, pago no fim (até 100%). Quem pegou o Frigo
+			-- não ganha isto (só o prêmio inteiro)
+			ChaseRange = 60, -- 14/11/2026 (pedido do usuário): +50% (era 40; antes 30)
+			ChasePerSecond = 0.08,
+			Duration = 60,
+			Species = "FrigoCamelo",
+			Scale = 1.5, -- 50% maior que um Frigo normal
+			SpeedFactor = 2, -- em relação a um jogador correndo fora do Coliseu
+			InvulnerableSeconds = 5, -- ao nascer, ninguém pega
+			BounceMinTurn = 30, -- ao bater, a nova direção fica pelo menos tantos graus longe da atual
+			BounceClearStuds = 100, -- 16/11/2026, pedido do usuário (era 60) -- ao bater, a nova direção precisa ter isso livre à frente
+			BounceTestStep = 5, -- de quantos em quantos graus testa as direções
+			-- 13/11/2026 (pedido do usuário): era 1.5. Muda de direção a cada ForceTurnEvery s...
+			ForceTurnEvery = 0.75,
+			ForceTurnMin = 40, -- ...em pelo menos tantos graus, sempre para um lado livre até a próxima troca...
+			TurnClearExtra = 0.3, -- ...com esta folga a mais (30% do trecho; sem lugar livre aceita a metade)
+			TouchBackExtra = 7, -- a hitbox vai isto a mais para trás, para compensar o atraso da rede (10/11/2026: 3 → 7)
+			TouchRadius = 3, -- studs no chão para contar como encostar
+			TouchHeight = 12,
+			AfterHitBoost = 0.5, -- ao voltar a andar depois de bater, corre tanto a mais (2x do jogador vira 3x)...
+			AfterHitBoostSeconds = 0.3, -- ...por este tempo, contado de quando ele volta a andar
+			HitStopSeconds = 0.05, -- bateu: fica parado este tempo antes de seguir
+			IconHeight = 14,
+			IconPixels = 44, -- tamanho máximo do escudo na tela; de longe para na metade disso
+			NameHeight = 11, -- nome em cima da cabeça
+			NameStuds = Vector2.new(12, 3), -- tamanho no mundo...
+			NameMinPixels = Vector2.new(130, 26), -- ...mais este mínimo: de longe ele para de diminuir aqui
+			-- Paredes só dele
+			CanalApothem = 85, -- volta de fora do canal (fecha as 4 pontes)
+			PlotMargin = 1.5, -- folga em volta do piso de cada terreno
+			RingFrom = 126, -- anel: procura a partir daqui (depois da rua de fora)...
+			RingTo = 330,
+			RingStep = 4,
+			RingSamples = 96,
+			RingMaxGround = 3, -- ...até o chão passar desta altura (montanha) ou virar água
+			RingMargin = 8, -- recua tanto do ponto achado
+			-- Obstáculos e chão
+			ProbeHeight = 3.5, -- altura do centro da esfera que testa o caminho
+			ProbeRadius = 2.5,
+			TurnLookAhead = 0.15, -- s à frente que precisam estar livres para virar
+			GroundProbeUp = 5, -- acima disso pegaria a copa das árvores como se fosse chão
+			GroundProbeDown = 40,
+			SpawnClearance = 12, -- nasce pelo menos esse tanto longe das paredes
+			SpawnTries = 80,
+		},
+		-- Caça aos Ovos (14/11/2026, pedido do usuário; Server/Events/EggHunt + Client/Controllers/EggHuntController).
+		-- Evento da ilha: nascem Count Ovos de Páscoa (EggConfig.Extra.EasterEgg) em lugares sorteados de
+		-- Config/EggHuntPoints. Segurar E por HoldDuration pega o ovo e paga na hora: diamantes de DiamondsMin a DiamondsMax
+		-- e IncomeSecondsMin a IncomeSecondsMax segundos de renda em moedas, pelo nível do brainrot mais alto (1 a 200;
+		-- com o bônus da Torre). Acaba quando pegam todos ou o tempo acaba
+		EggHunt = {
+			Name = "Caça aos Ovos",
+			Title = "CAÇA AOS OVOS",
+			Icon = "🐣",
+			Goal = "Ache os ovos de Páscoa pela ilha!\nCada ovo: 💎 e moedas na hora!",
+			Brawl = false,
+			Outside = true, -- acontece fora do Coliseu
+			Duration = 60,
+			Count = 10,
+			Egg = "EasterEgg", -- EggConfig.Extra
+			-- 14/11/2026 (pedido do usuário): 50–175 💎 e 75–225 s de renda (eram 50–125 💎 e 50–175 s)
+			DiamondsMin = 50,
+			DiamondsMax = 175,
+			IncomeSecondsMin = 75,
+			IncomeSecondsMax = 225,
+			HoldDuration = 0.5, -- segurar E
+			-- 14/11/2026 (pedido do usuário): durante o evento todo mundo fora do Coliseu fica com o Taco Dourado
+			-- (AirdropConfig.Bat) na mão e todos correm SpeedBonus a mais (+40%)
+			GoldenBat = true,
+			SpeedBonus = 0.4,
+			-- 19/11/2026 (pedido do usuário): os times seguem no tamanho 0% (sem o Tamanho do brainrot), como no Frigo
+			-- Dourado; Workspace "IslandTeamsZeroSize" → Client/FollowController (de 17 a 19/11 era o tamanho normal,
+			-- TeamsNormalSize)
+			TeamsZeroSize = true,
+			PromptDistance = 10,
+			PickSlack = 6, -- folga a mais na distância conferida no servidor (atraso da rede)
+			-- Desenho (só no cliente): altura do ovo, quanto sobe e desce, giro e brilhinhos para achar de longe
+			EggHeight = 2.8,
+			BobHeight = 0.3,
+			BobPeriod = 2.2,
+			SpinSpeed = 45, -- graus por segundo
+			SparkleRate = 3,
+			SparkleColor = Color3.fromRGB(255, 236, 150),
+		},
+		-- Evento Vulcão (16/11/2026, pedido do usuário; Server/Events/Volcano + Client/Controllers/VolcanoController; ilha em
+		-- MapConfig.VolcanoIsland). No último minuto antes (Announce) aparece a área verde na faixa bege da praça (Zone);
+		-- quem estiver nela quando começar vai para a ilha. Tela treme, o fogo do vulcão acende e bolas de fogo saem dele e
+		-- caem em círculos vermelhos (Radius; enchem em Warn s e matam com um golpe). A cada WaveEvery s caem mais e mais
+		-- rápido. Morreu ou caiu da ilha: câmera fixa (SpectateCamera) até o fim. Quem sobrevive ao Duration ganha
+		Volcano = {
+			Name = "Vulcão",
+			Title = "ERUPÇÃO DO VULCÃO",
+			Icon = "🌋",
+			Goal = "Fique na área verde da praça!\nNa ilha, fuja das bolas de fogo!",
+			-- Som da explosão no chão (16/11/2026, pedido do usuário): UM por leva de bolas, sorteado entre estes
+			ImpactSounds = { "rbxassetid://74149238738530", "rbxassetid://91288569991875" },
+			ImpactVolume = 0.288, -- 18/11/2026: -40% (era 0,48); 17/11/2026: -20% (era 0,8) e depois -25% (era 0,64)
+			Brawl = false,
+			Outside = true, -- acontece fora do Coliseu
+			Duration = 45, -- era 60 (16/11/2026)
+			-- Área verde: a praça inteira (MapConfig.Spawn.Center) até a borda de fora da faixa bege (Outer = apótema);
+			-- WallHeight = altura da parede de luz da borda
+			Zone = { Outer = 43.5, WallHeight = 5, Color = Color3.fromRGB(90, 230, 110) },
+			Radius = 8.1, -- studs de cada círculo vermelho (era 6; +35% em 16/11/2026)
+			Warn = 1.3, -- s do círculo aparecer até a bola cair (enche e mata)
+			Flight = 1.3, -- s de voo da bola, contados até a queda (ela sai do vulcão e chega junto com o círculo cheio)
+			FallBelow = 12, -- caiu mais que isso abaixo do chão da ilha = fora
+			-- Dificuldade: a cada WaveEvery s, uma onda nova; cada rajada tem Volley + VolleyGrow × onda círculos, e entre
+			-- rajadas Interval × IntervalDecay ^ onda s (mínimo MinInterval). AimShare = parte que mira em quem está vivo
+			WaveEvery = 5, -- era 6 (16/11/2026)
+			Volley = 2,
+			VolleyGrow = 1,
+			Interval = 1.6,
+			IntervalDecay = 0.85,
+			MinInterval = 0.35,
+			AimShare = 0.5,
+			AimSpread = 4, -- studs de erro da mira
+			SpawnRadius = 28, -- até onde a ilha espalha quem chega
+			ShakeSeconds = 2.5,
+			ShakeAngle = 1.6, -- graus
+			-- Câmera de quem morreu: relativa ao centro do chão da ilha
+			SpectateCamera = { Offset = Vector3.new(0, 55, 70), LookAt = Vector3.new(0, 0, 0) },
+			-- Prêmio de quem sobrevive até o fim (pelo nível do brainrot mais alto, com o bônus de eventos): diamantes e
+			-- VaultShare × limite do Cofre em moedas (4 = 400%). Quem foi e não chegou ao fim: participação
+			DiamondsMin = 100,
+			DiamondsMax = 800,
+			VaultShareMin = 2.4, -- 17/11/2026 (pedido do usuário): -40% (era 4)
+			VaultShareMax = 8.4, -- 17/11/2026 (pedido do usuário): -40% (era 14)
+			-- Participação: de ParticipationMin a ParticipationMax do prêmio, pelo tempo que ficou vivo na ilha
+			ParticipationMin = 0.1,
+			ParticipationMax = 0.5,
+			-- Taco do centro (EggFieldConfig.Bat) derruba só isso durante o evento (normal: 2 s)
+			BatDownSeconds = 0.6, -- 16/11/2026, pedido do usuário (era 0,3)
+			FireballColor = Color3.fromRGB(255, 120, 30),
+		},
+		-- Balão da Fortuna (15/11/2026, pedido do usuário; Server/Events/Balloon + Client/Controllers/BalloonController, caminho em
+		-- Shared/Events/BalloonPath). Evento da ilha: um balão roda a ilha e a cada BurstEvery s joga BurstBase + 1 por
+		-- jogador moedas em arco, em volta dele (como largar tralhas, só que longe). Encostar pega. Tipos em Coins (Weight
+		-- = chance), todos × Reward.bonus (bônus de evento: Torre e rebirth)
+		Balloon = {
+			Name = "Balão da Fortuna",
+			Title = "BALÃO DA FORTUNA",
+			Icon = "🎈",
+			Goal = "Siga o balão e pegue as moedas!\n⭐ níveis · ⚔️ talento · 💎 · 💰",
+			Brawl = false,
+			Outside = true, -- acontece fora do Coliseu
+			-- 15/11/2026 (pedido do usuário): do IslandHideTeamsBefore (10 s antes) até o fim, os times ficam pequenos
+			-- atrás do dono (em vez de sumir) e o Bombardiro de enfeite sai do céu
+			TeamsSmall = true,
+			ClearSky = true,
+			-- 15/11/2026 (pedido do usuário): todos correm SpeedBonus a mais e quem está fora do Coliseu fica com o Taco do
+			-- Balão (AirdropConfig.BalloonBat) na mão
+			SpeedBonus = 0.3,
+			BalloonBat = true,
+			BatAfterEnd = 5, -- 19/11/2026 (pedido do usuário): o taco fica mais 5 s depois do fim
+			-- 15/11/2026 (pedido do usuário): todos pulam JumpBonus a mais e têm pulo duplo em qualquer lugar da ilha
+			-- (DoubleJump num evento com Outside vale fora do Coliseu também; EventService refreshDoubleJump)
+			JumpBonus = 0.2,
+			DoubleJump = { SmokeSeconds = 0.75 },
+			Duration = 60,
+			-- Voo: círculo em volta do centro da ilha (dentro do círculo vermelho do desenho do usuário)
+			OrbitCenter = Vector3.new(0, 0, 15),
+			OrbitRadius = 150,
+			OrbitPeriod = 30, -- s para dar uma volta (15/11/2026: era 45, depois 39)
+			StartPoints = 6, -- pontos do círculo onde ele pode começar, sorteado a cada evento (16/11/2026, pedido do usuário)
+			Height = 45, -- altura do cesto (15/11/2026: 10 mais baixo, era 55)
+			BobHeight = 1.5,
+			BobPeriod = 4,
+			ArriveSeconds = 3, -- desce do céu no começo
+			ArriveFrom = 60, -- de quantos studs acima
+			-- Rajadas
+			BurstEvery = 6,
+			FirstBurstAt = 3,
+			BurstBase = 6, -- 16/11/2026 (pedido do usuário): era 5 (antes 3)
+			BurstPerPlayer = 1,
+			ThrowMin = 45.5, -- distância no chão do ponto embaixo do balão (15/11/2026: +30%, era 35–95)
+			ThrowMax = 123.5,
+			AngleJitter = 0.6, -- fração do espaço entre duas moedas que o ângulo pode variar
+			ThrowTries = 8, -- lugar proibido: sorteia de novo até tanto
+			FlightBase = 1.2, -- tempo de voo = FlightBase + distância / FlightSpeed
+			FlightSpeed = 70,
+			ArcHeight = 18, -- quanto o arco sobe acima da linha reta
+			-- Onde pode cair: dentro de LandRadius do centro da ilha, no chão (nem telhado, nem árvore, nem água) e fora dos
+			-- rabiscos do usuário: terrenos (Floor + PlotMargin), canal, centro da praça e Fusão
+			LandRadius = 225,
+			MaxGroundY = 4,
+			PlotMargin = 4,
+			Forbidden = {
+				{ Center = Vector3.new(0, 0, 0), From = 57, To = 88 }, -- canal (Moat 63–82)
+				{ Center = Vector3.new(0, 0, 160), To = 36 }, -- centro da praça (fonte)
+				{ Center = Vector3.new(106.05, 0, 143.04), To = 34 }, -- Fusão
+			},
+			-- Moedas
+			CoinDiameter = 4.8, -- 15/11/2026 (pedido do usuário): moeda e encostar +50% (era 3,2; 0,6; 2; 5; 8)
+			CoinThickness = 0.9,
+			CoinHover = 3, -- altura do centro da moeda acima do chão (subiu junto, senão a moeda maior entra no chão)
+			HaloDiameter = 14, -- brilho no chão em volta da moeda (15/11/2026: 2x, era 7)
+			-- Luz de verdade embaixo do cesto apontando para o chão (SpotLight; 15/11/2026, pedido do usuário, no lugar do
+			-- brilho desenhado). Range máximo do Roblox = 60 (o cesto fica a ~43 do chão)
+			Light = { Color = Color3.fromRGB(255, 215, 90), Brightness = 4, Range = 60, Angle = 70, Shadows = true },
+			SpinSpeed = 120, -- graus por segundo
+			PickRadius = 8.625, -- encostar (no chão; 15/11/2026: +15% a pedido do usuário, era 7,5)
+			PickHeight = 13.8, -- 15/11/2026: +15% junto (era 12)
+			-- Cada moeda vive Lifetime s depois de cair, mesmo depois do fim do evento, e pisca nos últimos BlinkSeconds
+			-- (15/11/2026, pedido do usuário: era 25 e todas sumiam juntas no fim do evento)
+			Lifetime = 20,
+			BlinkSeconds = 3,
+			Coins = {
+				-- 16/11/2026 (pedido do usuário): 💰 + 💎 = 70% das moedas (eram 65%), ⚔️ + ⭐ = 30%
+				-- 17/11/2026 (pedido do usuário): -30% de ouro, era VaultShare 0.6
+				Gold = { Weight = 37, VaultShare = 0.42, Symbol = "💰", Color = Color3.fromRGB(255, 200, 40) },
+				Diamond = { Weight = 33, Diamonds = 60, Symbol = "💎", Color = Color3.fromRGB(90, 220, 255) },
+				Talent = {
+					Weight = 16,
+					Talent = 16, -- +16 por moeda (17/11/2026; era 7, antes 5 e 3)
+					Symbol = "⚔️",
+					Color = Color3.fromRGB(120, 170, 255),
+				},
+				Level = { Weight = 14, Levels = 8, Symbol = "⭐", Color = Color3.fromRGB(255, 240, 120) }, -- +8 (20/11/2026), sem o bônus dos eventos (16/11/2026)
+			},
+			CoinColor = Color3.fromRGB(245, 190, 40),
+			CoinRimColor = Color3.fromRGB(205, 145, 25),
+			SayCooldown = 3, -- "equipe um brainrot" no máximo a cada tanto
+		},
+		CosmicEgg = {
+			Name = "Ovo Cósmico",
+			Title = "OVO CÓSMICO", -- em maiúsculas (o string.upper do Luau não mexe nos acentos)
+			Icon = "🥚",
+			Goal = "Segure o ovo até o fim!\nGanha o Ovo Cósmico!",
+			Brawl = false, -- briga entre brainrots tirada (BrawlConfig.PvP = false)
+			-- Os times dos jogadores não aparecem no Coliseu durante o evento (10/11/2026, pedido do usuário)
+			HideTeams = true,
+			-- Pulo duplo dentro do Coliseu enquanto vale (Client/DoubleJumpController; pedido do usuário, 06/11/2026):
+			-- o 2º pulo tem a altura do 1º; a fumacinha do pé some em SmokeSeconds
+			DoubleJump = { SmokeSeconds = 0.75 },
+
+			Visible = 60, -- duração: chegou a zero, quem está com o ovo ganha na hora (08/11/2026, sem o "??")
+			Overtime = 10, -- ovo solto no fim: quem pegar primeiro ganha, até este tempo
+			FallTime = 2, -- o ovo cai do céu no centro
+			FallHeight = 90, -- 13/11/2026: era 60 (o telão do Coliseu maior vai até ~87 de altura: o ovo cai de cima dele)
+
+			EggHeight = 3.2, -- só para pré-carregar a malha (EventStageController); o tamanho de verdade vem do VisualSize
+			-- 14/11/2026 (pedido do usuário): o ovo do evento aparece como um ovo do campo de VisualSize% (altura =
+			-- EggFieldConfig.EggHeight × SizeConfig.eggScale, igual no chão e na cabeça) e o círculo embaixo dele cresce
+			-- na mesma escala (PickRadius × eggScale)
+			VisualSize = 250,
+			PickRadius = 4, -- encostar no ovo solto (studs, no chão), para um ovo de 0%; o de verdade = × eggScale(VisualSize)
+			PrizeMinSize = 250, -- o ovo ganho no evento vem com pelo menos este tamanho (14/11/2026; Bombardiro continua 80%)
+			-- Encostar em quem carrega rouba o ovo na hora (08/11/2026, pedido do usuário). Hitbox afinada em 12/11/2026
+			-- (pedido do usuário; era raio 4, compensação 0,3 s e altura sem limite): raio no chão entre as raízes...
+			StealRadius = 3.38, -- 14/11/2026 (pedido do usuário): +30% (era 2,6; antes 2)
+			-- ...e altura: quem rouba pode estar até StealAbove studs acima de quem carrega (pulando em cima) e até
+			-- StealBelow abaixo
+			StealAbove = 7,
+			StealBelow = 11, -- 14/11/2026 (pedido do usuário): +6 para baixo (era 5; antes 3)
+			-- Compensação de atraso: na tela do jogador, quem corre com o ovo aparece um pouco atrás de onde está de verdade no
+			-- servidor. Vale também encostar onde ele estava há este tempo (segundos)
+			StealLagSeconds = 0.15,
+			StealBackLock = 0.5, -- quem perdeu o ovo fica este tempo sem poder pegar de novo
+			TakeImmunity = 1.5, -- quem acabou de pegar não pode ser roubado nesse tempo (buff "Invulnerable")
+			TakeBoost = 1.3, -- e corre tanto a mais (+130% desde 12/11/2026; era +90%)...
+			TakeBoostSeconds = 1.5, -- ...por este tempo
+			PlayerBats = false, -- taco dos jogadores desligado por enquanto (08/11/2026, pedido do usuário)
+			CarrierSpeed = 0.75, -- quem carrega fica 25% mais lento (jogadores e bots; 15% até 13/11/2026, 30% até 12/11/2026)
+
+			-- Tentou sair com ele ou levou tacada: o ovo cai no chão (08/11/2026, pedido do usuário). Saindo, cai no último lugar
+			-- válido, DropInward studs para dentro, na direção do centro; levando tacada, ali mesmo
+			-- Área do evento: o Coliseu inteiro, até a parede de fora, com os 4 portões bloqueados (08/11/2026, pedido do usuário)
+			-- 13/11/2026: área e portões × 1,5 com o Coliseu (eram 49; portão 50,5 / 3 / 18,2 / 14; LED 48,3 / 17,8 / 0,35)
+			ArenaApothem = 73.5,
+			Gates = {
+				Distance = 75.75, -- do centro até o meio da parede do portão
+				Thickness = 4.5,
+				Width = 27.3, -- o vão tem 27
+				Height = 21, -- até o topo do arco
+				OneWay = true, -- quem está fora atravessa e entra; quem está dentro não sai (false = fecha para todos)
+				StripDistance = 72.45, -- LED no chão, logo antes do bloqueio
+				StripLength = 26.7,
+				StripY = 0.525, -- o piso do portão fica em 0,45: o LED fica um pouco acima, sem faces no mesmo plano
+				-- grossura e altura do LED (as mesmas do LED em volta da arena, ZoneEdge)
+				StripWidth = 1.29,
+				StripHeight = 0.75,
+			},
+			DropInward = 5,
+			-- Rede de segurança (08/11/2026, pedido do usuário): a cada SafetyEvery s, ovo fora do Coliseu (mais SafetyMargin studs de
+			-- folga) ou acima de SafetyMaxHeight volta para o centro, mesmo na cabeça de alguém
+			SafetyEvery = 2,
+			SafetyMargin = 9, -- 13/11/2026: era 6 (Coliseu 50% maior)
+			SafetyMaxHeight = 120, -- em cima de um poste, com pulo duplo e a árvore de skills, passava de 40 (13/11/2026: era 80)
+			DropTime = 0.45, -- o arco até o chão (igual ao de largar tralha)
+			DropArc = 1.6, -- studs que sobe no meio do caminho
+			DropLock = 0.3, -- e espera antes de poder ser pego
+			-- Bots de teste que imitam jogadores (Server/Events/EggDebugBots): botão "+ Bot" do DEV durante o evento
+			DebugBots = {
+				Tag = "EggDebugBot",
+				Max = 8,
+				SpawnArea = 0.6, -- fração do raio do Coliseu onde nascem
+				EdgeArea = 0.95, -- não passam desta fração da área do evento (ArenaApothem), inclui arquibancada e portões
+				DoubleJumpDelay = 0.3, -- segundos depois de pular: o segundo pulo, se precisar
+				StepProbeHeight = 1.2, -- altura acima do pé onde procura obstáculo à frente
+				StepProbeAhead = 3.5, -- studs à frente: bateu em algo, pula
+				JumpMinDistance = 3, -- preso e com o destino mais longe que isso: pula (degraus da arquibancada)
+				FleeRadius = 60, -- só fogem de quem está até aqui (13/11/2026: era 40; Coliseu 50% maior)
+				FleeStep = 27, -- studs à frente para onde correm (era 18)
+				ReactionSeconds = 0.5, -- alguém pegou o ovo: tempo até os bots começarem a seguir (andam a esmo até lá)
+				WanderEvery = 3, -- sem o ovo: a cada tantos segundos...
+				WanderSeconds = 0.5, -- ...anda este tempo em linha reta numa direção sorteada
+			},
+			-- Tung Tung Tung Sahur do evento (Server/Events/EggBot; 08/11/2026, pedido do usuário)
+			Bot = {
+				Tag = "EggBot",
+				-- Grupos de colisão: o Tung atravessa jogadores e bots, mas continua pisando no chão
+				BodyGroup = "EggBotBody",
+				Species = "TungTungTungSahur",
+				DisplayName = "Tung Tung Tung Sahur",
+				SpeedFactor = 0.46552, -- da velocidade de um jogador (16/11/2026: +15% de novo, era 0,4048; 14/11/2026: +15%, era 0,352; antes 0,32)
+				SpawnOffset = Vector3.new(36, 0, 0), -- a partir do centro do Coliseu (13/11/2026: era 24)
+				Attacks = { "attack", "attack2" },
+				AttackRange = 7, -- studs: começa o golpe (o acerto usa a hitbox do taco)
+				-- Sem ninguém com o ovo: não persegue; só bate em quem entrar nesta caixa (studs, em volta dele)
+				GuardBox = 5,
+				IntroSeconds = 1, -- no começo do evento: ri parado este tempo antes de andar
+				LaughSeconds = 0.85, -- depois de acertar: ri parado
+				RestSeconds = 3, -- depois de rir: continua parado, sem atacar, e só então volta a perseguir
+				IdleExtraEvery = 5, -- sem alvo: "idle_2" por cima da "idle" a cada tantos segundos
+				JumpHeight = 15.625, -- 16/11/2026 (pedido do usuário): +25% de novo (era 12,5; 14/11/2026: era 10)
+				JumpWhenAbove = 2.5, -- o alvo está tantos studs acima: pula
+				JumpRange = 16, -- ... se estiver até esta distância
+				StuckCheck = 0.6, -- a cada tantos segundos confere se ficou preso
+				StuckStuds = 1.5, -- andou menos que isso: pula
+			},
+
+			-- Participantes que precisa ter para o vencedor levar o ovo (com menos, leva NoEggPrizeSeconds de R).
+			-- 0 = sempre dá o ovo, até sozinho: decisão do usuário (03/11/2026). O design sugeria 4 para ninguém
+			-- farmar sozinho num servidor vazio; rever no balanceamento (etapa 10).
+			MinParticipantsForEgg = 0,
+			NoEggPrizeSeconds = 135,
+			ConsolationSeconds = 45,
+			ConsolationMin = 150,
+			StealBonusSeconds = 10,
+			StealBonusMax = 3,
+			-- Prêmio por segurar o ovo (17/11/2026, pedido do usuário; antes só quem mais segurou levava): TODO jogador que
+			-- segurou pelo menos MinSeconds leva, subindo em linha reta até MaxSeconds (mais que isso = o máximo):
+			-- Diamonds = 💎 e VaultShare = parte do limite do Cofre em moedas (0.2 = 20%). Os dois × (1 + TopLevelBonus ×
+			-- nível do brainrot mais alto, 1 → 0 e 200 → 1): com nível 200 dobram. Depois, o bônus de eventos (Reward.bonus)
+			HoldPrize = {
+				MinSeconds = 1,
+				MaxSeconds = 25,
+				Diamonds = { Min = 10, Max = 200 },
+				VaultShare = { Min = 0.2, Max = 3 },
+				TopLevelBonus = 1,
+			},
+		},
+	},
+
+	-- Empurrão em jogador (roubo do ovo, Rei do Ringue): o servidor segura a física por este tempo
+	PushTime = 0.25,
+	PushLift = 12, -- velocidade para cima no empurrão (sai um pouquinho do chão)
+}
+
+-- Config de um evento pelo id
+function EventConfig.get(id: string): { [string]: any }?
+	return EventConfig.Events[id]
+end
+
+return EventConfig
 ]=]
 SOURCES["src/shared/Config/MutationConfig.luau"] = [=[
 --[[
@@ -6705,6 +8687,9 @@ export type PlayerData = {
 	IndexClaimed: { [string]: boolean }, -- prêmios do Index já pegos (raridade → true; Shared/Config/IndexConfig)
 	Eggs: { [string]: number }, -- ovos guardados na mochila: id do ovo → quantos
 	EggSizes: { [string]: { number } }, -- tamanho de cada ovo guardado que tem tamanho (ovos do campo): id → lista
+	Depot: { [string]: number }, -- Depósito do rebirth: ovos bloqueados (Config/DepotConfig)
+	DepotSizes: { [string]: { number } },
+	TradeUnlocked: boolean, -- pode doar e receber ovos
 	Items: { [string]: number }, -- itens da Máquina de Vendas guardados (id → quantos)
 	NextEggTalentBoosts: { [string]: number }, -- id do item (Tônico/Elixir) → fração; somam, um de cada (14/11/2026)
 	NextEggTalentBoost: number, -- Tônico/Elixir do Talento: fração do teto somada ao talento do próximo ovo (13/11/2026)
@@ -6753,12 +8738,15 @@ SOURCES["tools/json"] = [=[
 
 local Json = {}
 
-local ESCAPES = { ['"'] = '\\"', ["\\"] = "\\\\", ["\b"] = "\\b", ["\f"] = "\\f", ["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t" }
+local ESCAPES =
+	{ ['"'] = '\\"', ["\\"] = "\\\\", ["\b"] = "\\b", ["\f"] = "\\f", ["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t" }
 
 local function encodeString(text: string): string
-	return '"' .. text:gsub('[%c"\\]', function(char)
-		return ESCAPES[char] or string.format("\\u%04x", string.byte(char))
-	end) .. '"'
+	return '"'
+		.. text:gsub('[%c"\\]', function(char)
+			return ESCAPES[char] or string.format("\\u%04x", string.byte(char))
+		end)
+		.. '"'
 end
 
 local function isList(value: { [any]: any }): boolean
@@ -6853,7 +8841,8 @@ function Json.decode(text: string): any
 				break
 			elseif char == "\\" then
 				local nextChar = string.sub(text, index + 1, index + 1)
-				local map = { b = "\b", f = "\f", n = "\n", r = "\r", t = "\t", ['"'] = '"', ["\\"] = "\\", ["/"] = "/" }
+				local map =
+					{ b = "\b", f = "\f", n = "\n", r = "\r", t = "\t", ['"'] = '"', ["\\"] = "\\", ["/"] = "/" }
 				if nextChar == "u" then
 					local code = tonumber(string.sub(text, index + 2, index + 5), 16) or 63
 					table.insert(parts, utf8.char(code))
@@ -7129,7 +9118,7 @@ SOURCES["tools/runtime"] = [=[
 --[[
 	runtime — roda módulos do jogo (src/) fora do Roblox. Luau puro: serve no Lune (loader.luau) e no site (engine.luau).
 
-	Runtime.new(host) → { require = function("shared/Config/SpeciesConfig") }
+	Runtime.new(host) → { require = function("shared/Config/SpeciesConfig"), clock = relógio de mentira (makeClock) }
 	host = {
 		files = { ["src/shared/Config/X.luau"] = true, ... },    -- arquivos que existem
 		dirs = { ["src/shared/Config"] = { "X.luau", ... }, ... }, -- pastas e o que tem dentro
@@ -7206,8 +9195,27 @@ Runtime.task = {
 	cancel = function() end,
 }
 
+-- Relógio de mentira (luta da Piñata, em tempo real): com clock.now posto, os.clock() dos módulos dá essa hora e o
+-- task.delay vai para clock.pending (o simcore roda na hora certa). Sem ele, os.clock é o de verdade e o delay não faz nada
+local function makeClock()
+	local clock = { now = nil :: number?, pending = nil :: { any }?, Random = Runtime.Random }
+	local fakeOs = setmetatable({
+		clock = function()
+			return clock.now or os.clock()
+		end,
+	}, { __index = os })
+	local fakeTask = table.clone(Runtime.task)
+	fakeTask.delay = function(seconds: number?, fn: (...any) -> (), ...)
+		if clock.pending and clock.now then
+			table.insert(clock.pending, { At = clock.now + (seconds or 0), Fn = fn, Args = table.pack(...) })
+		end
+	end
+	return clock, fakeOs, fakeTask
+end
+
 function Runtime.new(host: any)
 	local files, dirs = host.files, host.dirs
+	local clock, fakeOs, fakeTask = makeClock()
 	local nodes: { [string]: any } = {}
 	local cache: { [string]: any } = {}
 
@@ -7320,7 +9328,8 @@ function Runtime.new(host: any)
 		base[key] = value
 	end
 	base.Random = base.Random or Runtime.Random
-	base.task = base.task or Runtime.task
+	base.task = fakeTask
+	base.os = fakeOs
 	base.game = game
 	base.workspace = empty
 	base.warn = function(...)
@@ -7356,6 +9365,7 @@ function Runtime.new(host: any)
 	end
 
 	return {
+		clock = clock,
 		require = function(path: string): any
 			local parts = string.split(path, "/")
 			local current = node(`{ROOT}/{parts[1]}`, parts[1], nil)
@@ -7377,12 +9387,13 @@ SOURCES["tools/simcore"] = [=[
 	local Sim = require(simcore)(requireGame)   -- requireGame("shared/Config/X") = o módulo do jogo (runtime.luau)
 	Sim.data() → espécies (Épico para cima), artefatos de luta, raridades, mutações, limites
 	Sim.run({ Runs, Teams = { A = { ["1"] = brainrot, ... }, B = {...} } }) → vitórias, tempo e dano por brainrot
+	Sim.run({ Mode = "Pinata", Runs, Teams = { A = {...} } }) → dano do time A na Piñata Absurda (BrawlSkills de verdade)
 	brainrot = { Species, Level, Stars, Mutation?, Artifact?, Artifact2?, Talent? (% nos três stats) }
 	Monta o brainrot como o BattleService:SpecFromBrainrot + bônus de base (sem a árvore de skills do dono) e roda o
 	motor de verdade do PvP (src/server/Combat/ArenaEngine).
 ]]
 
-return function(requireGame: (string) -> any)
+return function(requireGame: (string) -> any, clock: any?)
 	local SpeciesConfig = requireGame("shared/Config/SpeciesConfig")
 	local RarityConfig = requireGame("shared/Config/RarityConfig")
 	local ArtifactConfig = requireGame("shared/Config/ArtifactConfig")
@@ -7477,6 +9488,10 @@ return function(requireGame: (string) -> any)
 			MaxLevel = BrainrotConfig.MaxLevel,
 			MaxStars = BrainrotConfig.MaxStars,
 			MaxTalent = BrainrotConfig.MaxTalent,
+			Pinata = (function()
+				local config = requireGame("shared/Config/EventConfig").Events.Pinata
+				return { Duration = config.Duration, Reduction = config.DamageReduction or 0, Goal = config.GoalDamage }
+			end)(),
 		}
 	end
 
@@ -7516,7 +9531,11 @@ return function(requireGame: (string) -> any)
 			Level = brainrot.Level,
 			Stars = brainrot.Stars,
 			Mutation = brainrot.Mutation,
-			Stats = { Hp = math.floor(stats.Hp + 0.5), Atk = math.floor(stats.Atk + 0.5), Spd = math.floor(stats.Spd + 0.5) },
+			Stats = {
+				Hp = math.floor(stats.Hp + 0.5),
+				Atk = math.floor(stats.Atk + 0.5),
+				Spd = math.floor(stats.Spd + 0.5),
+			},
 			SpdTalent = brainrot.Talents.Spd,
 			ArtifactEffects = ArtifactConfig.effectsOf(brainrot),
 			Artifacts = ArtifactConfig.equipped(brainrot),
@@ -7622,7 +9641,219 @@ return function(requireGame: (string) -> any)
 		}
 	end
 
-	return { data = dumpData, run = runFights }
+	---------------------------------------------------------------- Piñata Absurda
+
+	-- A briga do Coliseu em tempo real (src/server/Events/BrawlSkills, o mesmo do jogo) contra o burro parado:
+	-- o laço do BrawlService (updateUnit) e o golpe do Pinata.onHit (redução, Chamas de Goes, Jakalopita) refeitos aqui,
+	-- com relógio de mentira (runtime clock). Os brainrots já começam colados no burro (no jogo eles andam até ele).
+	local function runPinata(input: any)
+		assert(clock, "relógio de mentira faltando (runtime.clock)")
+		local BrawlSkills = requireGame("server/Events/BrawlSkills")
+		local BrawlConfig = requireGame("shared/Config/BrawlConfig")
+		local EventConfig = requireGame("shared/Config/EventConfig")
+		local config = EventConfig.Events.Pinata
+		local runs = math.clamp(math.floor(tonumber(input.Runs) or 100), 1, 500)
+		local duration = tonumber(input.Duration) or config.Duration
+		local reduction = if input.Reduction ~= nil
+			then tonumber(input.Reduction) or 0
+			else (config.DamageReduction or 0)
+
+		local entries = {}
+		for key, entry in (input.Teams and input.Teams.A) or {} do
+			local slot = tonumber(key)
+			if slot and entry and entry.Species and SpeciesConfig.get(entry.Species) then
+				table.insert(entries, { Slot = slot, Entry = entry })
+			end
+		end
+		table.sort(entries, function(a, b)
+			return a.Slot < b.Slot
+		end)
+		if #entries == 0 then
+			return { Error = "Ponha pelo menos um brainrot no Time A." }
+		end
+
+		local perUnit = {}
+		for _, item in entries do
+			local brainrot = brainrotOf(item.Entry)
+			local stats = BrainrotStats.get(brainrot)
+			perUnit[item.Slot] = {
+				Side = "A",
+				Slot = item.Slot,
+				Species = brainrot.Species,
+				Atk = stats.Atk,
+				Spd = stats.Spd,
+				Hp = stats.Hp,
+				Total = 0,
+				Basic = 0,
+				Skill = 0,
+				Goes = 0,
+				Jakalopita = 0,
+				Hits = 0,
+			}
+		end
+
+		local totalSum, best, worst = 0, 0, math.huge
+		local failures, firstError = 0, nil
+		for index = 1, runs do
+			local ok, err = pcall(function()
+				local rng = clock.Random.new(index * 7919 + 13)
+				local owner = { UserId = 1, Name = "Sim" }
+				local units = {}
+				local runDamage = 0
+				local function add(row: any, source: string, amount: number)
+					row[source] += amount
+					row.Total += amount
+					runDamage += amount
+				end
+				local function onHit(unit: any, multiplier: number, basic: boolean?)
+					local row = perUnit[unit.Index]
+					local variation = rng:NextNumber(CombatConfig.DamageMin, CombatConfig.DamageMax)
+					local amount = row.Atk * variation * multiplier
+					local pierce = 0
+					for _, effect in unit.Effects.Pierce or {} do
+						pierce += effect.ReductionPierce or 0
+					end
+					local pierced = amount * reduction * math.min(1, pierce)
+					amount *= 1 - reduction * (1 - math.min(1, pierce))
+					row.Hits += 1
+					add(row, if basic then "Basic" else "Skill", amount - pierced)
+					if pierced > 0 then
+						add(row, "Goes", pierced)
+					end
+					local share = 0
+					for _, effect in unit.Effects.MaxHpHit or {} do
+						share += effect.Percent or 0
+					end
+					if share > 0 then
+						add(row, "Jakalopita", amount * share * ArtifactConfig.MaxHpHitPinataMultiplier)
+					end
+				end
+				local ground = { X = 0, Y = 0, Z = 0 }
+				local ctx = {
+					rng = rng,
+					enemiesNear = function()
+						return {}
+					end,
+					allies = function()
+						return units
+					end,
+					emit = function() end,
+					bagGround = function()
+						return ground
+					end,
+					hitBag = function(unit: any, multiplier: number)
+						onHit(unit, multiplier)
+					end,
+					changed = function() end,
+					onKo = function() end,
+					onRevive = function() end,
+				}
+				for _, item in entries do
+					local brainrot = brainrotOf(item.Entry)
+					local species = SpeciesConfig.get(brainrot.Species)
+					local role = if BrawlConfig.Roles[species.Role] then species.Role else "Fighter"
+					local maxHp = BrawlConfig.Roles[role].Hp
+					local unit = {
+						Owner = owner,
+						Index = item.Slot,
+						BrainrotId = "sim" .. item.Slot,
+						Role = role,
+						MaxHp = maxHp,
+						Hp = maxHp,
+						Cooldown = 0,
+						Ko = false,
+						Species = brainrot.Species,
+						Spd = BrainrotStats.get(brainrot).Spd,
+					}
+					BrawlSkills.attach(unit, brainrot.Passive, 0, ArtifactConfig.effectsOf(brainrot), brainrot.Stars)
+					table.insert(units, unit)
+				end
+
+				local pending = {}
+				clock.pending = pending
+				clock.now = 0
+				BrawlSkills.onArrive(ctx, units)
+				local dt = BrawlConfig.Tick
+				local tickAt = 0
+				while true do
+					-- Próxima coisa: um task.delay (golpes seguidos, Za Warudo) ou o próximo tick de 0,1 s
+					local nextIndex, nextAt = nil, tickAt
+					for i, job in pending do
+						if job.At < nextAt then
+							nextIndex, nextAt = i, job.At
+						end
+					end
+					if nextAt >= duration then
+						break
+					end
+					clock.now = nextAt
+					if nextIndex then
+						local job = table.remove(pending, nextIndex)
+						job.Fn(table.unpack(job.Args, 1, job.Args.n))
+					else
+						local now = tickAt
+						for _, unit in units do
+							unit.Hitting = false
+							unit.Cooldown -= dt
+							BrawlSkills.tick(ctx, unit, dt, now)
+							if not unit.Ko and not BrawlSkills.isStunned(unit, now) and unit.Cooldown <= 0 then
+								BrawlSkills.bagAttack(ctx, unit, now, function(multiplier: number, basic: boolean)
+									onHit(unit, multiplier, basic)
+								end)
+							end
+						end
+						tickAt += dt
+					end
+				end
+				BrawlSkills.forget(owner)
+				totalSum += runDamage
+				best = math.max(best, runDamage)
+				worst = math.min(worst, runDamage)
+			end)
+			clock.now, clock.pending = nil, nil
+			if not ok then
+				failures += 1
+				firstError = firstError or tostring(err)
+			end
+		end
+
+		local done = runs - failures
+		local units = {}
+		for _, item in entries do
+			local row = perUnit[item.Slot]
+			for _, field in { "Total", "Basic", "Skill", "Goes", "Jakalopita", "Hits" } do
+				row[field] = math.floor(row[field] / math.max(1, done) + 0.5)
+			end
+			row.Dps = math.floor(row.Total / duration + 0.5)
+			table.insert(units, row)
+		end
+		local average = totalSum / math.max(1, done)
+		return {
+			Mode = "Pinata",
+			Runs = done,
+			Failures = failures,
+			Error = if done == 0 then firstError else nil,
+			Sample = if firstError then { Error = firstError } else nil,
+			Duration = duration,
+			Reduction = reduction,
+			Total = math.floor(average + 0.5),
+			Best = math.floor(best + 0.5),
+			Worst = if done > 0 then math.floor(worst + 0.5) else 0,
+			Dps = math.floor(average / duration + 0.5),
+			Goal = config.GoalDamage,
+			Goals = math.floor(average / config.GoalDamage),
+			Units = units,
+		}
+	end
+
+	local function run(input: any)
+		if input.Mode == "Pinata" then
+			return runPinata(input)
+		end
+		return runFights(input)
+	end
+
+	return { data = dumpData, run = run }
 end
 ]=]
 local hostLoad = ...
@@ -7681,7 +9912,7 @@ local runtime = Runtime.new({
 	load = load,
 	globals = globals,
 })
-local Sim = makeSim(runtime.require)
+local Sim = makeSim(runtime.require, runtime.clock)
 
 -- call("data") / call("run", textoJSON) → texto JSON (erro vira { Error = ... })
 return function(command, text)

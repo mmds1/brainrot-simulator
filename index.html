@@ -90,6 +90,20 @@ tr.sideA td:first-child { border-left: 5px solid var(--a); } tr.sideB td:first-c
 .err { color: var(--b); font-weight: 600; white-space: pre-wrap; }
 .note { color: var(--muted); font-size: 12.5px; margin-top: 10px; }
 .tablewrap { overflow-x: auto; }
+.modes { display: flex; justify-content: center; gap: 8px; margin: 4px 0 14px; }
+.btn.mode { font-size: 16px; padding: 5px 16px; }
+.btn.mode.on { background: linear-gradient(#5aa0ff, var(--a)); color: #fff; text-shadow: 0 2px 0 rgba(0,0,0,.35); }
+.slot-top .btn.small { flex: none; }
+.btn:disabled { opacity: .45; cursor: default; }
+body.pinata .team.B, body.pinata #swap { display: none; }
+body.pinata .teams { grid-template-columns: minmax(0, 620px); justify-content: center; }
+.pinata-only { display: none; }
+body.pinata .pinata-only { display: flex; }
+.big { font-size: 30px; font-weight: 700; }
+.cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.card { background: var(--row); border-radius: 12px; padding: 8px 14px; min-width: 130px; }
+.card span { display: block; color: var(--muted); font-size: 12.5px; }
+.card b { font-size: 20px; }
 </style>
 </head>
 <body>
@@ -98,17 +112,24 @@ tr.sideA td:first-child { border-left: 5px solid var(--a); } tr.sideB td:first-c
   <p id="sub">Carregando o motor de luta...</p>
 </header>
 <main>
+  <div class="modes">
+    <button class="btn mode" data-mode="Fight">⚔️ Luta 3x3</button>
+    <button class="btn mode" data-mode="Pinata">🪅 Piñata Absurda</button>
+  </div>
   <div class="teams">
     <section class="team A"><h2><span class="dot"></span>Time A</h2><div id="teamA"></div></section>
     <section class="team B"><h2><span class="dot"></span>Time B</h2><div id="teamB"></div></section>
   </div>
   <div class="controls">
-    <span class="row"><label for="runs">Lutas:</label><input id="runs" type="number" min="1" max="2000" value="200"></span>
+    <span class="row"><label for="runs" id="runsLabel">Lutas:</label><input id="runs" type="number" min="1" max="2000" value="200"></span>
+    <span class="row pinata-only"><label for="pDuration">Duração:</label><input id="pDuration" type="number" min="5" max="600" value="45"> s</span>
+    <span class="row pinata-only"><label for="pReduction">Redução de dano:</label><input id="pReduction" type="number" min="0" max="95" value="30"> %</span>
     <button class="btn go" id="go">LUTAR!</button>
     <button class="btn" id="swap">⇄ Trocar times</button>
   </div>
   <section class="result" id="result"></section>
-  <p class="note">Sem árvore de skills dos donos. Tamanho não muda a luta. Cada luta usa uma semente diferente; o sorteio não é o mesmo do Roblox, então a mesma semente não repete a luta do jogo.</p>
+  <p class="note" id="pinataNote" style="display:none">Piñata: a briga do Coliseu em tempo real (as habilidades do jogo, BrawlSkills), contra o burro parado. Os brainrots já começam colados nele; no jogo eles andam um pouco antes do 1º golpe. Sem árvore de skills.</p>
+  <p class="note" id="fightNote">Sem árvore de skills dos donos. Tamanho não muda a luta. Cada luta usa uma semente diferente; o sorteio não é o mesmo do Roblox, então a mesma semente não repete a luta do jogo.</p>
 </main>
 <script type="module">
 import { LuauState } from "./vendor/luau-web/index.js";
@@ -146,6 +167,8 @@ function picker(items, value, placeholder, onPick) {
   const input = document.createElement("input");
   input.placeholder = "Buscar...";
   search.appendChild(input);
+  const rows = document.createElement("div");
+  list.append(search, rows);
   function paintButton() {
     btn.textContent = "";
     const item = items.find(i => i.id === value);
@@ -153,14 +176,13 @@ function picker(items, value, placeholder, onPick) {
     else { const s = document.createElement("span"); s.style.color = "var(--muted)"; s.textContent = placeholder; btn.appendChild(s); }
   }
   function render() {
-    list.textContent = "";
-    list.appendChild(search);
+    rows.textContent = "";
     const q = input.value.trim().toLowerCase();
     const none = document.createElement("div");
     none.className = "pick-item";
     none.innerHTML = `<span style="color:var(--muted)">— ${placeholder} —</span>`;
     none.onclick = () => choose("");
-    list.appendChild(none);
+    rows.appendChild(none);
     let group = null;
     for (const item of items) {
       if (q && !item.label.toLowerCase().includes(q)) continue;
@@ -169,7 +191,7 @@ function picker(items, value, placeholder, onPick) {
         const g = document.createElement("div");
         g.className = "pick-group";
         g.appendChild(nameSpan(rarityById[group] ? rarityById[group].Name : group, group));
-        list.appendChild(g);
+        rows.appendChild(g);
       }
       const row = document.createElement("div");
       row.className = "pick-item" + (item.id === value ? " sel" : "");
@@ -177,7 +199,7 @@ function picker(items, value, placeholder, onPick) {
       if (item.hint) { const h = document.createElement("small"); h.textContent = item.hint; row.appendChild(h); }
       row.title = item.title || "";
       row.onclick = () => choose(item.id);
-      list.appendChild(row);
+      rows.appendChild(row);
     }
   }
   function choose(id) { value = id; root.classList.remove("open"); paintButton(); onPick(id); }
@@ -223,6 +245,19 @@ function renderTeam(side) {
     num.className = "slot-num";
     num.textContent = index + 1;
     top.append(num, picker(speciesItems(), unit.Species, "Nenhum", id => { unit.Species = id; renderTeam(side); save(); }));
+    if (unit.Species) {
+      // Duplicar: a mesma cópia (nível, estrelas, artefatos...) no 1º lugar vazio do time
+      const dup = document.createElement("button");
+      dup.className = "btn small"; dup.textContent = "⧉ Duplicar";
+      const free = state[side].findIndex(u => !u.Species);
+      dup.disabled = free < 0;
+      dup.title = free < 0 ? "Time cheio" : "Copiar para o lugar " + (free + 1);
+      dup.onclick = () => { state[side][free] = Object.assign(blank(), JSON.parse(JSON.stringify(unit))); renderTeam(side); save(); };
+      const clear = document.createElement("button");
+      clear.className = "btn small"; clear.textContent = "✖"; clear.title = "Tirar do time";
+      clear.onclick = () => { state[side][index] = blank(); renderTeam(side); save(); };
+      top.append(dup, clear);
+    }
     slot.appendChild(top);
     if (unit.Species) {
       const species = speciesById[unit.Species];
@@ -292,7 +327,20 @@ function renderTeam(side) {
   });
 }
 
-function save() { try { localStorage.setItem("battlesim", JSON.stringify(state)); } catch (e) {} }
+let mode = "Fight";
+function save() { try { localStorage.setItem("battlesim", JSON.stringify(state)); localStorage.setItem("battlesim-mode", mode); } catch (e) {} }
+function setMode(next) {
+  mode = next === "Pinata" ? "Pinata" : "Fight";
+  document.body.classList.toggle("pinata", mode === "Pinata");
+  document.querySelectorAll(".btn.mode").forEach(b => b.classList.toggle("on", b.dataset.mode === mode));
+  document.getElementById("runsLabel").textContent = mode === "Pinata" ? "Simulações:" : "Lutas:";
+  document.querySelector(".team.A h2").lastChild.textContent = mode === "Pinata" ? "Seu time" : "Time A";
+  document.getElementById("pinataNote").style.display = mode === "Pinata" ? "" : "none";
+  document.getElementById("fightNote").style.display = mode === "Pinata" ? "none" : "";
+  document.getElementById("result").classList.remove("show");
+  save();
+}
+document.querySelectorAll(".btn.mode").forEach(b => b.onclick = () => setMode(b.dataset.mode));
 function load() {
   try {
     const saved = JSON.parse(localStorage.getItem("battlesim") || "null");
@@ -317,9 +365,17 @@ async function run() {
   try {
     const runs = Math.max(1, Math.min(2000, Number(document.getElementById("runs").value) || 100));
     await new Promise(r => setTimeout(r, 30)); // deixa a tela mostrar "Lutando..." antes das contas
-    const res = JSON.parse(await engine("run", JSON.stringify({ Runs: runs, Teams: teams })));
+    const input = { Runs: runs, Teams: teams };
+    if (mode === "Pinata") {
+      input.Mode = "Pinata";
+      input.Runs = Math.min(500, runs);
+      input.Duration = Math.max(5, Math.min(600, Number(document.getElementById("pDuration").value) || 45));
+      input.Reduction = Math.max(0, Math.min(95, Number(document.getElementById("pReduction").value) || 0)) / 100;
+    }
+    const res = JSON.parse(await engine("run", JSON.stringify(input)));
     box.classList.add("show");
     if (res.Error) { box.innerHTML = `<div class="err">${res.Error}</div>`; return; }
+    if (res.Mode === "Pinata") { showPinata(box, res); return; }
     const wa = res.Wins.A || 0, wb = res.Wins.B || 0, wd = res.Draws || 0, total = res.Runs || 1;
     const seg = (cls, n, label) => n > 0 ? `<div class="${cls}" style="width:${n / total * 100}%">${label} ${pct(n / total)}</div>` : "";
     const maxDealt = Math.max(1, ...res.Units.map(u => u.Dealt));
@@ -357,11 +413,50 @@ async function run() {
   }
 }
 
+function showPinata(box, res) {
+  const team = Math.max(1, res.Total);
+  const maxTotal = Math.max(1, ...res.Units.map(u => u.Total));
+  let rows = "";
+  for (const u of res.Units) {
+    const s = speciesById[u.Species];
+    const name = document.createElement("div");
+    name.appendChild(nameSpan(s ? s.Name : u.Species, s ? s.Rarity : ""));
+    rows += `<tr class="sideA"><td>${u.Slot} ${name.innerHTML}</td>
+      <td class="num">${fmt(u.Atk)}</td><td class="num">${fmt(u.Spd)}</td><td class="num">${fmt(u.Hits)}</td>
+      <td class="num">${fmt(u.Basic)}</td><td class="num">${fmt(u.Skill)}</td>
+      <td class="num">${u.Goes ? fmt(u.Goes) : "-"}</td><td class="num">${u.Jakalopita ? fmt(u.Jakalopita) : "-"}</td>
+      <td class="num"><b>${fmt(u.Total)}</b></td><td><div class="bar"><i style="width:${u.Total / maxTotal * 100}%;background:var(--a)"></i></div></td>
+      <td class="num">${fmt(u.Dps)}</td><td class="num">${pct(u.Total / team)}</td></tr>`;
+  }
+  box.innerHTML = `
+    <div class="cards">
+      <div class="card"><span>Dano do time (média)</span><b class="big">${fmt(res.Total)}</b></div>
+      <div class="card"><span>Dano por segundo</span><b>${fmt(res.Dps)}</b></div>
+      <div class="card"><span>A cada ${fmt(res.Goal)} de dano</span><b>${fmt(res.Goals)} prêmios</b></div>
+      <div class="card"><span>Melhor / pior</span><b>${fmt(res.Best)} / ${fmt(res.Worst)}</b></div>
+      <div class="card"><span>Duração · redução</span><b>${res.Duration} s · ${pct(res.Reduction)}</b></div>
+    </div>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Brainrot</th><th class="num">Ataque</th><th class="num">Velocidade</th><th class="num">Golpes</th>
+      <th class="num">Básico</th><th class="num">Habilidade</th><th class="num">Goes</th><th class="num">Jakalopita</th>
+      <th class="num">Total</th><th></th><th class="num">Por segundo</th><th class="num">Do time</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <p class="note">Média de ${fmt(res.Runs)} simulações. Goes = dano que as Chamas de Goes devolveram furando a redução.</p>
+    ${res.Failures ? `<div class="err">Simulações com erro: ${res.Failures}\n${res.Sample ? res.Sample.Error : ""}</div>` : ""}`;
+}
+
 document.getElementById("go").onclick = run;
 document.getElementById("swap").onclick = () => { const a = state.A; state.A = state.B; state.B = a; renderTeam("A"); renderTeam("B"); save(); };
 
+const USE_API = false; // server.py troca para true (lá a luta roda no Lune)
 let engine = null;
 async function boot() {
+  if (USE_API) {
+    engine = async (command, text) => command === "data"
+      ? await fetch("/api/data").then(r => r.text())
+      : await fetch("/api/run", { method: "POST", body: text }).then(r => r.text());
+    return JSON.parse(await engine("data", ""));
+  }
   let lua = null;
   // __compile: o loadstring do luau-web (dentro do Luau ele não existe); o engine compila cada módulo por ele
   lua = await LuauState.createAsync({ __compile: (text, name) => lua.loadstring(text, name, true) });
@@ -379,6 +474,13 @@ boot().then(data => {
   data.Artifacts.forEach(a => artifactById[a.Id] = a);
   document.getElementById("sub").textContent = "Motor de verdade do PvP do jogo · brainrots Épicos para cima";
   load();
+  if (data.Pinata) {
+    document.getElementById("pDuration").value = data.Pinata.Duration;
+    document.getElementById("pReduction").value = Math.round(data.Pinata.Reduction * 100);
+  }
+  let savedMode = "Fight";
+  try { savedMode = localStorage.getItem("battlesim-mode") || "Fight"; } catch (e) {}
+  setMode(savedMode);
   renderTeam("A"); renderTeam("B");
 }).catch(e => { document.querySelector("main").innerHTML = `<div class="err">Não consegui ler os dados: ${e}</div>`; });
 </script>
