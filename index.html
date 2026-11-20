@@ -448,6 +448,7 @@ function showPinata(box, res) {
 document.getElementById("go").onclick = run;
 document.getElementById("swap").onclick = () => { const a = state.A; state.A = state.B; state.B = a; renderTeam("A"); renderTeam("B"); save(); };
 
+const ENGINE_VERSION = "1795214681"; // build_site troca pela hora do build
 const USE_API = false; // server.py troca para true (lá a luta roda no Lune)
 let engine = null;
 async function boot() {
@@ -460,7 +461,7 @@ async function boot() {
   let lua = null;
   // __compile: o loadstring do luau-web (dentro do Luau ele não existe); o engine compila cada módulo por ele
   lua = await LuauState.createAsync({ __compile: (text, name) => lua.loadstring(text, name, true) });
-  const source = await fetch("./engine.luau").then(r => r.text());
+  const source = await fetch("./engine.luau?v=" + ENGINE_VERSION).then(r => r.text()); // versão: o navegador não usa um motor velho guardado
   // O luau-web devolve uma Promise com a lista dos valores de retorno
   const [call] = await lua.loadstring(source, "engine", true)();
   engine = async (command, text) => (await call(command, text))[0];
