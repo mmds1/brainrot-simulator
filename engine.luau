@@ -9403,6 +9403,7 @@ return function(requireGame: (string) -> any, clock: any?)
 	local BrainrotStats = requireGame("shared/Brainrot/BrainrotStats")
 	local BattleDamage = requireGame("shared/Brainrot/BattleDamage")
 	local PassiveText = requireGame("shared/Brainrot/PassiveText")
+	local PassivePower = requireGame("shared/Brainrot/PassivePower")
 	local ArenaEngine = requireGame("server/Combat/ArenaEngine")
 
 	local MIN_RARITY = "Epic"
@@ -9429,7 +9430,17 @@ return function(requireGame: (string) -> any, clock: any?)
 		local list = {}
 		for _, species in SpeciesConfig.List do
 			if rarityIndex(species.Rarity) >= rarityIndex(MIN_RARITY) then
-				local ok, text = pcall(PassiveText.describe, species.Passive, 0)
+				-- Texto da habilidade em cada número de estrelas (PassivePower: cresce com elas), no PvP (Arena) e na briga
+				-- do Coliseu (Piñata); antes ia só o de 0 estrelas
+				local arena, brawl = {}, {}
+				for stars = 0, BrainrotConfig.MaxStars do
+					local passive = PassivePower.passive(species, stars)
+					local okArena, arenaText = pcall(PassiveText.describe, passive, true)
+					local okBrawl, brawlText = pcall(PassiveText.describe, passive, false)
+					arena[stars + 1] = if okArena then arenaText else ""
+					brawl[stars + 1] = if okBrawl then brawlText else ""
+				end
+				local ok, text = true, arena[1]
 				table.insert(list, {
 					Id = species.Id,
 					Name = species.Name,
@@ -9437,6 +9448,8 @@ return function(requireGame: (string) -> any, clock: any?)
 					Role = species.Role,
 					Base = species.Base,
 					Passive = if ok then text else nil,
+					PassiveByStars = arena,
+					BrawlPassiveByStars = brawl,
 				})
 			end
 		end

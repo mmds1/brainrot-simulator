@@ -218,6 +218,11 @@ function picker(items, value, placeholder, onPick) {
 }
 document.addEventListener("click", () => document.querySelectorAll(".pick.open").forEach(p => p.classList.remove("open")));
 
+// Texto da habilidade com as estrelas (cresce com elas) e do modo: PvP = por tempo; Piñata = briga do Coliseu
+function passiveFor(species, stars) {
+  const list = mode === "Pinata" ? species.BrawlPassiveByStars : species.PassiveByStars;
+  return (list && list[stars || 0]) || species.Passive || "";
+}
 function speciesItems() {
   return DATA.Species.map(s => ({ id: s.Id, label: s.Name, rarity: s.Rarity, hint: ROLES[s.Role] || s.Role, title: s.Passive || "" }));
 }
@@ -316,10 +321,11 @@ function renderTeam(side) {
       add("Artefato 1", art1);
       add("Artefato 2", art2);
       slot.appendChild(grid);
-      if (species && species.Passive) {
+      const passiveText = species && passiveFor(species, unit.Stars);
+      if (passiveText) {
         const p = document.createElement("div");
         p.className = "passive";
-        p.textContent = "✨ " + species.Passive;
+        p.textContent = "✨ " + passiveText;
         slot.appendChild(p);
       }
     }
@@ -338,6 +344,7 @@ function setMode(next) {
   document.getElementById("pinataNote").style.display = mode === "Pinata" ? "" : "none";
   document.getElementById("fightNote").style.display = mode === "Pinata" ? "none" : "";
   document.getElementById("result").classList.remove("show");
+  if (DATA) { renderTeam("A"); renderTeam("B"); }
   save();
 }
 document.querySelectorAll(".btn.mode").forEach(b => b.onclick = () => setMode(b.dataset.mode));
@@ -448,7 +455,7 @@ function showPinata(box, res) {
 document.getElementById("go").onclick = run;
 document.getElementById("swap").onclick = () => { const a = state.A; state.A = state.B; state.B = a; renderTeam("A"); renderTeam("B"); save(); };
 
-const ENGINE_VERSION = "1795214681"; // build_site troca pela hora do build
+const ENGINE_VERSION = "1795214941"; // build_site troca pela hora do build
 const USE_API = false; // server.py troca para true (lá a luta roda no Lune)
 let engine = null;
 async function boot() {
